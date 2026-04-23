@@ -33,6 +33,9 @@ export interface AppConfig {
   logFile?: string;
   logMaxBytes: number;
   logMaxFiles: number;
+  agentInactivityTimeoutSeconds: number;
+  cronInactivityTimeoutSeconds: number;
+  cronHardTimeoutSeconds: number;
 }
 
 function optionalEnv(name: string): string | undefined {
@@ -76,6 +79,19 @@ function parsePositiveInteger(value: string | number | undefined, fallback: numb
   if (typeof value === "string") {
     const parsed = Number.parseInt(value.trim(), 10);
     if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return fallback;
+}
+
+function parseNonNegativeInteger(value: string | number | undefined, fallback: number): number {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    return Math.floor(value);
+  }
+  if (typeof value === "string") {
+    const parsed = Number.parseInt(value.trim(), 10);
+    if (Number.isFinite(parsed) && parsed >= 0) {
       return parsed;
     }
   }
@@ -136,6 +152,15 @@ export function loadConfig(): AppConfig {
     logLevel: parseLogLevel(optionalEnv("SELFAGENT_LOG_LEVEL") ?? rootConfig.logLevel),
     logFile: optionalEnv("SELFAGENT_LOG_FILE") ?? rootConfig.logFile,
     logMaxBytes: parsePositiveInteger(optionalEnv("SELFAGENT_LOG_MAX_BYTES") ?? rootConfig.logMaxBytes, 10 * 1024 * 1024),
-    logMaxFiles: parsePositiveInteger(optionalEnv("SELFAGENT_LOG_MAX_FILES") ?? rootConfig.logMaxFiles, 5)
+    logMaxFiles: parsePositiveInteger(optionalEnv("SELFAGENT_LOG_MAX_FILES") ?? rootConfig.logMaxFiles, 5),
+    agentInactivityTimeoutSeconds: parseNonNegativeInteger(
+      optionalEnv("SELFAGENT_AGENT_INACTIVITY_TIMEOUT_SECONDS"),
+      0
+    ),
+    cronInactivityTimeoutSeconds: parseNonNegativeInteger(
+      optionalEnv("SELFAGENT_CRON_INACTIVITY_TIMEOUT_SECONDS"),
+      0
+    ),
+    cronHardTimeoutSeconds: parseNonNegativeInteger(optionalEnv("SELFAGENT_CRON_HARD_TIMEOUT_SECONDS"), 0)
   };
 }

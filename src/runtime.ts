@@ -12,7 +12,7 @@ import {
 } from "./cron.js";
 import { getConversationPaths } from "./paths.js";
 import { createLogger } from "./logger.js";
-import { createConversationServices, runConversationTurn, runScheduledTask } from "./session.js";
+import { SelfAgentTimeoutError, createConversationServices, runConversationTurn, runScheduledTask } from "./session.js";
 import { TelegramAdapter } from "./telegram.js";
 import { createTelegramPreviewStream } from "./telegram-stream.js";
 import type { ConversationRef } from "./types.js";
@@ -218,6 +218,14 @@ export async function startTelegramRuntime(config: AppConfig): Promise<void> {
             jobId: job.id,
             error
           });
+          if (error instanceof SelfAgentTimeoutError) {
+            deliveredMessageIds = await sendTelegramFinalReply(
+              deliveryAdapter,
+              conversation.chatId,
+              error.message,
+              conversation.threadId
+            );
+          }
           const runId = `failed-${Date.now()}`;
           await appendCronRunRecord(config.stateRoot, job.id, runId, {
             runId,
@@ -510,7 +518,8 @@ export async function startTelegramRuntime(config: AppConfig): Promise<void> {
           conversationKey: paths.key,
           error
         });
-        await adapter.sendText(conversation.chatId, `Error: ${message}`, conversation.threadId);
+        const outboundMessage = error instanceof SelfAgentTimeoutError ? message : `Error: ${message}`;
+        await adapter.sendText(conversation.chatId, outboundMessage, conversation.threadId);
       }
     });
   });

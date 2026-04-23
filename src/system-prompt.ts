@@ -5,7 +5,8 @@ export function buildTelegramPromptAppend(
   conversation: ConversationRef,
   conversationPaths: ConversationPaths,
   memory: string,
-  recentCronDeliveries: string
+  recentCronDeliveries: string,
+  activeSessionFile?: string
 ): string {
   return `
 ## SelfAgent Telegram Runtime
@@ -26,7 +27,8 @@ You are operating inside a Telegram-backed agent runtime built on top of pi.
 - Conversation skills: ${conversationPaths.skillsDir}
 - Conversation attachments: ${conversationPaths.attachmentsDir}
 - Conversation scratch: ${conversationPaths.scratchDir}
-- Conversation session transcript: ${conversationPaths.sessionFile}
+- Conversation session directory: ${conversationPaths.sessionDir}
+- Active conversation transcript: ${activeSessionFile ?? "(created on first persisted assistant reply)"}
 
 ### Memory
 ${memory}

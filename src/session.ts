@@ -40,6 +40,8 @@ import { buildCronTaskPromptAppend, buildTelegramPromptAppend, buildUserPrompt }
 import type { ComputerUseRequest, ConversationRef, IncomingAttachment } from "./types.js";
 
 const logger = createLogger("session");
+const PROMPT_TIMEOUT_POLL_MS = 5_000;
+const PROMPT_TIMEOUT_HEARTBEAT_MS = 30_000;
 
 export interface ConversationServices {
   config: AppConfig;
@@ -52,6 +54,30 @@ export interface ConversationServices {
 export interface ConversationTurnCallbacks {
   onTextDelta?: (delta: string) => Promise<void> | void;
   onFinalText?: (text: string) => Promise<void> | void;
+}
+
+export class SelfAgentTimeoutError extends Error {
+  constructor(
+    public readonly kind: "inactivity" | "hard",
+    public readonly scope: "interactive" | "cron",
+    public readonly timeoutSeconds: number,
+    public readonly elapsedSeconds: number,
+    public readonly lastActivityAt: string,
+    message: string
+  ) {
+    super(message);
+    this.name = "SelfAgentTimeoutError";
+  }
+}
+
+interface PromptTimeoutOptions {
+  scope: "interactive" | "cron";
+  label: string;
+  inactivityTimeoutSeconds: number;
+  hardTimeoutSeconds?: number;
+  getLastActivityAt: () => number;
+  messageForKind: (kind: "inactivity" | "hard") => string;
+  logContext: Record<string, string | number | undefined>;
 }
 
 const attachSchema = Type.Object({
@@ -474,6 +500,117 @@ function resolveSelectedCronSkills(
   return { skills, missingSkillNames };
 }
 
+async function abortTimedOutSession(
+  session: AgentSession,
+  timeoutError: SelfAgentTimeoutError,
+  logContext: Record<string, string | number | undefined>
+): Promise<void> {
+  try {
+    await session.abort();
+  } catch (error) {
+    logger.warn("Failed to abort timed out session", {
+      ...logContext,
+      scope: timeoutError.scope,
+      timeoutKind: timeoutError.kind,
+      timeoutSeconds: timeoutError.timeoutSeconds,
+      error
+    });
+  }
+}
+
+async function promptWithTimeouts(
+  session: AgentSession,
+  prompt: string,
+  options: PromptTimeoutOptions
+): Promise<void> {
+  const startedAt = Date.now();
+  let lastHeartbeatAt = startedAt;
+  let settled = false;
+  let interval: ReturnType<typeof setInterval> | undefined;
+
+  const cleanup = (): void => {
+    settled = true;
+    if (interval) {
+      clearInterval(interval);
+      interval = undefined;
+    }
+  };
+
+  const monitorPromise = new Promise<never>((_resolve, reject) => {
+    const triggerTimeout = (kind: "inactivity" | "hard", now: number, lastActivityAt: number): void => {
+      if (settled) {
+        return;
+      }
+      cleanup();
+      const timeoutSeconds = kind === "inactivity" ? options.inactivityTimeoutSeconds : options.hardTimeoutSeconds ?? 0;
+      const timeoutError = new SelfAgentTimeoutError(
+        kind,
+        options.scope,
+        timeoutSeconds,
+        Math.max(1, Math.ceil((now - startedAt) / 1000)),
+        new Date(lastActivityAt).toISOString(),
+        options.messageForKind(kind)
+      );
+      logger.warn("Agent run timed out", {
+        ...options.logContext,
+        scope: options.scope,
+        label: options.label,
+        timeoutKind: kind,
+        timeoutSeconds,
+        elapsedSeconds: timeoutError.elapsedSeconds,
+        idleSeconds: Math.max(0, Math.floor((now - lastActivityAt) / 1000)),
+        lastActivityAt: timeoutError.lastActivityAt
+      });
+      void abortTimedOutSession(session, timeoutError, options.logContext).finally(() => {
+        reject(timeoutError);
+      });
+    };
+
+    interval = setInterval(() => {
+      if (settled) {
+        cleanup();
+        return;
+      }
+      const now = Date.now();
+      const lastActivityAt = options.getLastActivityAt();
+      if (now - lastHeartbeatAt >= PROMPT_TIMEOUT_HEARTBEAT_MS) {
+        logger.debug("Agent run still waiting for activity", {
+          ...options.logContext,
+          scope: options.scope,
+          label: options.label,
+          elapsedSeconds: Math.floor((now - startedAt) / 1000),
+          idleSeconds: Math.max(0, Math.floor((now - lastActivityAt) / 1000))
+        });
+        lastHeartbeatAt = now;
+      }
+      if (options.inactivityTimeoutSeconds > 0) {
+        const inactivityMs = options.inactivityTimeoutSeconds * 1000;
+        if (now - lastActivityAt >= inactivityMs) {
+          triggerTimeout("inactivity", now, lastActivityAt);
+          return;
+        }
+      }
+      if (options.hardTimeoutSeconds && options.hardTimeoutSeconds > 0) {
+        const hardTimeoutMs = options.hardTimeoutSeconds * 1000;
+        if (now - startedAt >= hardTimeoutMs) {
+          triggerTimeout("hard", now, lastActivityAt);
+        }
+      }
+    }, PROMPT_TIMEOUT_POLL_MS);
+  });
+
+  try {
+    await Promise.race([
+      session.prompt(prompt).finally(() => {
+        cleanup();
+      }),
+      monitorPromise
+    ]);
+  } finally {
+    cleanup();
+  }
+}
+
 export async function createConversationServices(
   config: AppConfig,
   conversation: ConversationRef,
@@ -514,6 +651,7 @@ export async function runConversationTurn(
   await mkdir(paths.attachmentsDir, { recursive: true });
   await mkdir(paths.scratchDir, { recursive: true });
   await mkdir(paths.skillsDir, { recursive: true });
+  await mkdir(paths.sessionDir, { recursive: true });
 
   const memory = readMemory(services.config.workspaceRoot, paths);
   const skills = loadWorkspaceAndConversationSkills(services.config.workspaceRoot, paths);
@@ -525,15 +663,21 @@ export async function runConversationTurn(
     attachmentCount: attachments.length,
     userTextChars: userText.length
   });
+  const sessionManager = SessionManager.continueRecent(services.config.workspaceRoot, paths.sessionDir);
+  const activeSessionFile = sessionManager.getSessionFile();
   const resourceLoader = buildResourceLoader(
     services.config,
     skills,
-    buildTelegramPromptAppend(services.config.workspaceRoot, conversation, paths, memory, recentCronDeliveries)
+    buildTelegramPromptAppend(
+      services.config.workspaceRoot,
+      conversation,
+      paths,
+      memory,
+      recentCronDeliveries,
+      activeSessionFile
+    )
   );
   await resourceLoader.reload();
-
-  const sessionManager =
-    await exists(paths.sessionFile) ? SessionManager.open(paths.sessionFile, paths.dir, services.config.workspaceRoot) : SessionManager.create(services.config.workspaceRoot, paths.dir);
   const approvalStore = new ApprovalStore(paths.approvalFile);
 
   const customTools: ToolDefinition[] = [
@@ -547,7 +691,7 @@ export async function runConversationTurn(
     conversationKey: paths.key,
     model: resolved.label,
     attachments: attachments.length,
-    sessionFile: paths.sessionFile
+    sessionFile: activeSessionFile
   });
   const { session } = await createAgentSession({
     cwd: services.config.workspaceRoot,
@@ -566,6 +710,7 @@ export async function runConversationTurn(
   let finalAssistantError = "";
   let finalAssistantStopReason = "";
   let actualModelLabel = "";
+  let lastActivityAt = 0;
   let callbackQueue = Promise.resolve();
   let lastFinalCallbackText = "";
   const queueCallback = (name: "onTextDelta" | "onFinalText", value: string): void => {
@@ -584,6 +729,7 @@ export async function runConversationTurn(
       });
   };
   const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+    lastActivityAt = Date.now();
     if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
       streamedReply += event.assistantMessageEvent.delta;
       queueCallback("onTextDelta", event.assistantMessageEvent.delta);
@@ -625,7 +771,18 @@ export async function runConversationTurn(
       conversationKey: paths.key,
       promptChars: prompt.length
     });
-    await session.prompt(prompt);
+    lastActivityAt = Date.now();
+    await promptWithTimeouts(session, prompt, {
+      scope: "interactive",
+      label: paths.key,
+      inactivityTimeoutSeconds: services.config.agentInactivityTimeoutSeconds,
+      getLastActivityAt: () => lastActivityAt,
+      messageForKind: () => "The model stopped responding before the request finished. Please try again.",
+      logContext: {
+        conversationKey: paths.key,
+        requestedModel: resolved.label
+      }
+    });
     await callbackQueue;
     const extracted = extractLastAssistantText(session);
     if (!streamedReply.trim() && !finalAssistantReply.trim() && !extracted && finalAssistantError) {
@@ -705,9 +862,8 @@ export async function runScheduledTask(
   );
   await resourceLoader.reload();
 
-  const sessionManager = await exists(runPaths.sessionFile)
-    ? SessionManager.open(runPaths.sessionFile, runPaths.dir, services.config.workspaceRoot)
-    : SessionManager.create(services.config.workspaceRoot, runPaths.dir);
+  const sessionManager = SessionManager.create(services.config.workspaceRoot, runPaths.dir);
+  const activeSessionFile = sessionManager.getSessionFile();
 
   const customTools: ToolDefinition[] = [createAttachTool(services)];
   const resolved = describeResolvedModel(services.config, services.modelRegistry, {
@@ -719,7 +875,8 @@ export async function runScheduledTask(
     runId,
     model: resolved.label,
     selectedSkills: job.skillNames,
-    missingSkillNames
+    missingSkillNames,
+    sessionFile: activeSessionFile
   });
 
   const { session } = await createAgentSession({
@@ -739,8 +896,10 @@ export async function runScheduledTask(
   let finalAssistantError = "";
   let finalAssistantStopReason = "";
   let actualModelLabel = "";
+  let lastActivityAt = 0;
 
   const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+    lastActivityAt = Date.now();
     if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
       streamedReply += event.assistantMessageEvent.delta;
     }
@@ -758,7 +917,24 @@ export async function runScheduledTask(
     const prompt = missingSkillNames.length > 0
       ? `Requested skills missing: ${missingSkillNames.join(", ")}\n\n${job.prompt}`
       : job.prompt;
-    await session.prompt(prompt.trim());
+    lastActivityAt = Date.now();
+    await promptWithTimeouts(session, prompt.trim(), {
+      scope: "cron",
+      label: `${job.id}:${runId}`,
+      inactivityTimeoutSeconds: services.config.cronInactivityTimeoutSeconds,
+      hardTimeoutSeconds: services.config.cronHardTimeoutSeconds,
+      getLastActivityAt: () => lastActivityAt,
+      messageForKind: (kind) =>
+        kind === "hard"
+          ? `Scheduled task "${job.name}" exceeded the maximum execution time and was aborted.`
+          : `Scheduled task "${job.name}" timed out because the model stopped responding.`,
+      logContext: {
+        jobId: job.id,
+        jobName: job.name,
+        runId,
+        requestedModel: resolved.label
+      }
+    });
     const extracted = extractLastAssistantText(session);
     if (!streamedReply.trim() && !finalAssistantReply.trim() && !extracted && finalAssistantError) {
       const modelText = actualModelLabel || resolved.label;
@@ -783,14 +959,5 @@ export async function runScheduledTask(
   } finally {
     unsubscribe();
     session.dispose();
-  }
-}
-
-async function exists(path: string): Promise<boolean> {
-  try {
-    await import("node:fs/promises").then(({ access }) => access(path));
-    return true;
-  } catch {
-    return false;
   }
 }

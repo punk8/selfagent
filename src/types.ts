@@ -8,7 +8,7 @@ export interface ConversationRef {
 export interface ConversationPaths {
   key: string;
   dir: string;
-  sessionFile: string;
+  sessionDir: string;
   attachmentsDir: string;
   skillsDir: string;
   scratchDir: string;

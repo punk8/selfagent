@@ -428,7 +428,6 @@ export function createCronRunPaths(stateRoot: string, jobId: string, runId: stri
   const dir = resolve(getCronPaths(stateRoot).runsDir, jobId, runId);
   return {
     dir,
-    sessionFile: resolve(dir, "session.jsonl"),
     attachmentsDir: resolve(dir, "attachments"),
     scratchDir: resolve(dir, "scratch")
   };

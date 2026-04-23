@@ -13,7 +13,7 @@ export function getConversationPaths(stateRoot: string, conversation: Conversati
   return {
     key,
     dir,
-    sessionFile: resolve(dir, "session.jsonl"),
+    sessionDir: dir,
     attachmentsDir: resolve(dir, "attachments"),
     skillsDir: resolve(dir, "skills"),
     scratchDir: resolve(dir, "scratch"),
