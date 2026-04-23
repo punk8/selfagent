@@ -5,6 +5,7 @@ import { dirname } from "node:path";
 import { AuthStorage } from "@mariozechner/pi-coding-agent";
 import { createTelegramAuthorizationRequest, formatAuthorizationInstruction } from "./access.js";
 import { loadConfig, type AppConfig } from "./config.js";
+import { createCronJob, loadCronJobs, saveCronJobs, updateCronJob } from "./cron.js";
 import { createLogger } from "./logger.js";
 import { detectInstallMode, getSelfAgentVersion } from "./package-meta.js";
 import { choose, confirm, ensureInteractiveTerminal, promptSecret, promptWithDefault } from "./prompts.js";
@@ -670,6 +671,172 @@ export async function removeModelCommand(profileIdArg?: string): Promise<void> {
   process.stdout.write(`Removed model profile "${profileId}".\n`);
 }
 
+function parseOptionalNumber(value: string | undefined): number | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const parsed = Number.parseInt(trimmed, 10);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`Invalid numeric value: ${trimmed}`);
+  }
+  return parsed;
+}
+
+function formatCronOrigin(job: ReturnType<typeof loadCronJobs>[number]): string {
+  return job.origin.threadId
+    ? `telegram:${job.origin.chatId}/thread:${job.origin.threadId}`
+    : `telegram:${job.origin.chatId}`;
+}
+
+export async function addCronCommand(): Promise<void> {
+  ensureInteractiveTerminal();
+  const config = loadConfig();
+  const name = (await promptWithDefault("Task name", "daily-brief")).trim();
+  const schedule = (await promptWithDefault("Schedule", "0 9 * * *")).trim();
+  const prompt = (await promptWithDefault("Task prompt", "Summarize the most important updates and send a concise report.")).trim();
+  const skillNamesRaw = await promptWithDefault("Skills (comma-separated, optional)", "");
+  const chatId = parseOptionalNumber(await promptWithDefault("Telegram chat id", ""));
+  if (chatId === undefined) {
+    throw new Error("Telegram chat id is required for cron task delivery.");
+  }
+  const threadId = parseOptionalNumber(await promptWithDefault("Telegram thread id (optional)", ""));
+  const modelProvider = (await promptWithDefault("Model provider override (optional)", "")).trim() || undefined;
+  const modelId = (await promptWithDefault("Model id override (optional)", "")).trim() || undefined;
+
+  const jobs = loadCronJobs(config.stateRoot);
+  const job = createCronJob({
+    name,
+    prompt,
+    scheduleInput: schedule,
+    skillNames: skillNamesRaw
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean),
+    origin: {
+      platform: "telegram",
+      chatId,
+      threadId
+    },
+    modelProvider,
+    modelId
+  });
+  jobs.push(job);
+  await saveCronJobs(config.stateRoot, jobs);
+  logger.info("Cron task created", {
+    jobId: job.id,
+    name: job.name,
+    schedule: job.schedule.display,
+    origin: formatCronOrigin(job)
+  });
+  process.stdout.write(
+    [
+      `Created cron task "${job.name}".`,
+      `Job ID: ${job.id}`,
+      `Schedule: ${job.schedule.display}`,
+      `Next run: ${job.nextRunAt ?? "(none)"}`,
+      `Origin: ${formatCronOrigin(job)}`
+    ].join("\n") + "\n"
+  );
+}
+
+export async function listCronCommand(): Promise<void> {
+  const config = loadConfig();
+  const jobs = loadCronJobs(config.stateRoot);
+  if (jobs.length === 0) {
+    printSection("Configured cron tasks:", ["  (none)"]);
+    return;
+  }
+  const lines = jobs.map((job) => {
+    const status = job.enabled ? "enabled" : "paused";
+    return `  - ${job.id} [${status}] ${job.name} schedule=${job.schedule.display} next=${job.nextRunAt ?? "(none)"} last=${job.lastStatus ?? "(never)"} origin=${formatCronOrigin(job)} skills=${job.skillNames.join(",") || "(none)"}`;
+  });
+  printSection("Configured cron tasks:", lines);
+}
+
+async function mutateCronJobCommand(
+  action: "pause" | "resume" | "remove" | "run",
+  jobIdArg?: string
+): Promise<void> {
+  const config = loadConfig();
+  const jobs = loadCronJobs(config.stateRoot);
+  if (jobs.length === 0) {
+    throw new Error("No cron tasks are configured.");
+  }
+
+  let jobId = jobIdArg?.trim();
+  if (!jobId) {
+    ensureInteractiveTerminal();
+    const selection = await choose(
+      `Select cron task to ${action}`,
+      jobs.map((job) => `${job.id} (${job.name})`)
+    );
+    jobId = jobs[selection]?.id;
+  }
+
+  const index = jobs.findIndex((job) => job.id === jobId);
+  if (index < 0) {
+    throw new Error(`Unknown cron task: ${jobId ?? "(none)"}`);
+  }
+  const job = jobs[index]!;
+
+  if (action === "remove") {
+    const confirmed =
+      process.stdin.isTTY && process.stdout.isTTY
+        ? await confirm(`Remove cron task "${job.name}" (${job.id})?`, false)
+        : true;
+    if (!confirmed) {
+      process.stdout.write("Cancelled.\n");
+      return;
+    }
+    jobs.splice(index, 1);
+    await saveCronJobs(config.stateRoot, jobs);
+    process.stdout.write(`Removed cron task "${job.id}".\n`);
+    return;
+  }
+
+  if (action === "pause") {
+    jobs[index] = updateCronJob(job, { enabled: false });
+    await saveCronJobs(config.stateRoot, jobs);
+    process.stdout.write(`Paused cron task "${job.id}".\n`);
+    return;
+  }
+
+  if (action === "resume") {
+    jobs[index] = updateCronJob(job, { enabled: true });
+    await saveCronJobs(config.stateRoot, jobs);
+    process.stdout.write(`Resumed cron task "${job.id}". Next run: ${jobs[index]?.nextRunAt ?? "(none)"}\n`);
+    return;
+  }
+
+  jobs[index] = {
+    ...job,
+    enabled: true,
+    nextRunAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+  await saveCronJobs(config.stateRoot, jobs);
+  process.stdout.write(
+    `Cron task "${job.id}" marked due. It will run on the next scheduler tick while SelfAgent is running.\n`
+  );
+}
+
+export async function pauseCronCommand(jobIdArg?: string): Promise<void> {
+  await mutateCronJobCommand("pause", jobIdArg);
+}
+
+export async function resumeCronCommand(jobIdArg?: string): Promise<void> {
+  await mutateCronJobCommand("resume", jobIdArg);
+}
+
+export async function removeCronCommand(jobIdArg?: string): Promise<void> {
+  await mutateCronJobCommand("remove", jobIdArg);
+}
+
+export async function runCronCommand(jobIdArg?: string): Promise<void> {
+  await mutateCronJobCommand("run", jobIdArg);
+}
+
 async function maybeConfigureMissingStartDependency(params: {
   config: AppConfig;
   missing: "channel" | "model";
@@ -1035,7 +1202,13 @@ export function printUsage(): void {
       "  selfagent channels authorize-user",
       "  selfagent models add",
       "  selfagent models list",
-      "  selfagent models remove <profile-id>"
+      "  selfagent models remove <profile-id>",
+      "  selfagent cron add",
+      "  selfagent cron list",
+      "  selfagent cron pause <job-id>",
+      "  selfagent cron resume <job-id>",
+      "  selfagent cron remove <job-id>",
+      "  selfagent cron run <job-id>"
     ].join("\n") + "\n"
   );
 }

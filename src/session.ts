@@ -15,12 +15,28 @@ import { Type } from "typebox";
 import type { Static } from "typebox";
 import { ApprovalStore } from "./approvals.js";
 import { executeComputerUse } from "./computer-use.js";
+import {
+  appendCronRunRecord,
+  appendRecentCronDelivery,
+  createCronJob,
+  createCronRunId,
+  createCronRunPaths,
+  describeCronOrigin,
+  findCronJob,
+  formatRecentCronDeliveriesForPrompt,
+  loadRecentCronDeliveries,
+  loadCronJobs,
+  saveCronJobs,
+  summarizeCronResult,
+  updateCronJob,
+  type CronJob
+} from "./cron.js";
 import type { AppConfig } from "./config.js";
 import { createLogger } from "./logger.js";
 import { readMemory } from "./memory.js";
 import { getConversationPaths } from "./paths.js";
 import { loadWorkspaceAndConversationSkills } from "./skills.js";
-import { buildTelegramPromptAppend, buildUserPrompt } from "./system-prompt.js";
+import { buildCronTaskPromptAppend, buildTelegramPromptAppend, buildUserPrompt } from "./system-prompt.js";
 import type { ComputerUseRequest, ConversationRef, IncomingAttachment } from "./types.js";
 
 const logger = createLogger("session");
@@ -56,6 +72,24 @@ const computerUseSchema = Type.Object({
   url: Type.Optional(Type.String()),
   text: Type.Optional(Type.String()),
   key: Type.Optional(Type.String())
+});
+
+const cronTaskSchema = Type.Object({
+  action: Type.Union([
+    Type.Literal("add"),
+    Type.Literal("list"),
+    Type.Literal("pause"),
+    Type.Literal("resume"),
+    Type.Literal("remove"),
+    Type.Literal("run")
+  ]),
+  jobId: Type.Optional(Type.String()),
+  name: Type.Optional(Type.String()),
+  schedule: Type.Optional(Type.String()),
+  prompt: Type.Optional(Type.String()),
+  skillNames: Type.Optional(Type.Array(Type.String())),
+  modelProvider: Type.Optional(Type.String()),
+  modelId: Type.Optional(Type.String())
 });
 
 function isPathWithin(path: string, root: string): boolean {
@@ -149,6 +183,136 @@ function createComputerUseTool(
   };
 }
 
+function createCronTaskTool(
+  conversation: ConversationRef,
+  services: ConversationServices
+): ToolDefinition<typeof cronTaskSchema> {
+  return {
+    name: "cron_task",
+    label: "cron_task",
+    description: "Create and manage scheduled tasks that deliver results back to this Telegram conversation.",
+    promptSnippet: "`cron_task`: create, list, pause, resume, remove, or trigger scheduled tasks for this Telegram conversation",
+    promptGuidelines: [
+      "Use `cron_task` when the user wants a scheduled or recurring task.",
+      "When adding a task, provide a clear schedule and self-contained prompt.",
+      "Prefer the current conversation as the task's notification destination."
+    ],
+    parameters: cronTaskSchema,
+    execute: async (_toolCallId, params) => {
+      const jobs = loadCronJobs(services.config.stateRoot);
+      const sameOrigin = (job: CronJob) =>
+        job.origin.platform === "telegram" &&
+        job.origin.chatId === conversation.chatId &&
+        (job.origin.threadId ?? undefined) === (conversation.threadId ?? undefined);
+
+      if (params.action === "add") {
+        const name = params.name?.trim();
+        const schedule = params.schedule?.trim();
+        const prompt = params.prompt?.trim();
+        if (!name || !schedule || !prompt) {
+          throw new Error("cron_task add requires `name`, `schedule`, and `prompt`.");
+        }
+        const job = createCronJob({
+          name,
+          prompt,
+          scheduleInput: schedule,
+          skillNames: params.skillNames ?? [],
+          origin: describeCronOrigin(conversation),
+          modelProvider: params.modelProvider,
+          modelId: params.modelId
+        });
+        jobs.push(job);
+        await saveCronJobs(services.config.stateRoot, jobs);
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Scheduled task created.\nJob ID: ${job.id}\nName: ${job.name}\nSchedule: ${job.schedule.display}\nNext run: ${job.nextRunAt ?? "(none)"}`
+            }
+          ],
+          details: { jobId: job.id }
+        };
+      }
+
+      if (params.action === "list") {
+        const scoped = jobs.filter(sameOrigin);
+        const summary =
+          scoped.length === 0
+            ? "No scheduled tasks are bound to this Telegram conversation."
+            : scoped
+                .map(
+                  (job) =>
+                    `- ${job.id} ${job.enabled ? "[enabled]" : "[paused]"} ${job.name} | schedule=${job.schedule.display} | next=${job.nextRunAt ?? "(none)"} | last=${job.lastStatus ?? "(never)"}`
+                )
+                .join("\n");
+        return {
+          content: [{ type: "text" as const, text: summary }],
+          details: { count: scoped.length }
+        };
+      }
+
+      const jobId = params.jobId?.trim();
+      if (!jobId) {
+        throw new Error(`cron_task ${params.action} requires \`jobId\`.`);
+      }
+      const index = jobs.findIndex((job) => job.id === jobId && sameOrigin(job));
+      if (index < 0) {
+        throw new Error(`Scheduled task not found in this conversation: ${jobId}`);
+      }
+      const current = jobs[index]!;
+
+      if (params.action === "remove") {
+        jobs.splice(index, 1);
+        await saveCronJobs(services.config.stateRoot, jobs);
+        return {
+          content: [{ type: "text" as const, text: `Removed scheduled task ${current.id} (${current.name}).` }],
+          details: { jobId: current.id }
+        };
+      }
+
+      if (params.action === "pause") {
+        jobs[index] = updateCronJob(current, { enabled: false });
+        await saveCronJobs(services.config.stateRoot, jobs);
+        return {
+          content: [{ type: "text" as const, text: `Paused scheduled task ${current.id} (${current.name}).` }],
+          details: { jobId: current.id }
+        };
+      }
+
+      if (params.action === "resume") {
+        jobs[index] = updateCronJob(current, { enabled: true });
+        await saveCronJobs(services.config.stateRoot, jobs);
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Resumed scheduled task ${current.id} (${current.name}). Next run: ${jobs[index]?.nextRunAt ?? "(none)"}`
+            }
+          ],
+          details: { jobId: current.id }
+        };
+      }
+
+      jobs[index] = {
+        ...current,
+        enabled: true,
+        nextRunAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+      await saveCronJobs(services.config.stateRoot, jobs);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Triggered scheduled task ${current.id} (${current.name}). It will run on the next scheduler tick.`
+          }
+        ],
+        details: { jobId: current.id }
+      };
+    }
+  };
+}
+
 function extractLastAssistantText(session: AgentSession): string {
   for (let i = session.messages.length - 1; i >= 0; i -= 1) {
     const message = session.messages[i];
@@ -226,12 +390,7 @@ function extractAssistantErrorDetails(message: unknown): { stopReason?: string; 
   };
 }
 
-function buildResourceLoader(
-  config: AppConfig,
-  conversation: ConversationRef,
-  memory: string,
-  skills: Skill[]
-): DefaultResourceLoader {
+function buildResourceLoader(config: AppConfig, skills: Skill[], promptAppend: string): DefaultResourceLoader {
   return new DefaultResourceLoader({
     cwd: config.workspaceRoot,
     agentDir: config.agentDir,
@@ -242,24 +401,30 @@ function buildResourceLoader(
       return { skills: [...merged.values()], diagnostics: current.diagnostics };
     },
     appendSystemPromptOverride: (base) => {
-      const conversationPaths = getConversationPaths(config.stateRoot, conversation);
-      return [...base, buildTelegramPromptAppend(config.workspaceRoot, conversation, conversationPaths, memory)];
+      return [...base, promptAppend];
     }
   });
 }
 
-function resolveConfiguredModel(config: AppConfig, modelRegistry: ModelRegistry) {
-  if (config.modelProvider && config.modelId) {
-    const model = modelRegistry.find(config.modelProvider, config.modelId);
+function resolveConfiguredModel(
+  config: AppConfig,
+  modelRegistry: ModelRegistry,
+  overrides?: { modelProvider?: string; modelId?: string }
+) {
+  const modelProvider = overrides?.modelProvider ?? config.modelProvider;
+  const modelId = overrides?.modelId ?? config.modelId;
+
+  if (modelProvider && modelId) {
+    const model = modelRegistry.find(modelProvider, modelId);
     if (!model) {
-      throw new Error(`Configured model not found: ${config.modelProvider}/${config.modelId}`);
+      throw new Error(`Configured model not found: ${modelProvider}/${modelId}`);
     }
     return model;
   }
-  if (config.modelProvider && config.modelId === undefined) {
-    const available = modelRegistry.getAvailable().find((candidate) => candidate.provider === config.modelProvider);
+  if (modelProvider && modelId === undefined) {
+    const available = modelRegistry.getAvailable().find((candidate) => candidate.provider === modelProvider);
     if (!available) {
-      throw new Error(`No authenticated model available for provider: ${config.modelProvider}`);
+      throw new Error(`No authenticated model available for provider: ${modelProvider}`);
     }
     return available;
   }
@@ -268,19 +433,45 @@ function resolveConfiguredModel(config: AppConfig, modelRegistry: ModelRegistry)
 
 function describeResolvedModel(
   config: AppConfig,
-  modelRegistry: ModelRegistry
+  modelRegistry: ModelRegistry,
+  overrides?: { modelProvider?: string; modelId?: string }
 ): { model: ReturnType<typeof resolveConfiguredModel>; label: string } {
-  const model = resolveConfiguredModel(config, modelRegistry);
+  const modelProvider = overrides?.modelProvider ?? config.modelProvider;
+  const modelId = overrides?.modelId ?? config.modelId;
+  const model = resolveConfiguredModel(config, modelRegistry, overrides);
   if (model) {
     return { model, label: `${model.provider}/${model.id}` };
   }
   if (modelRegistry.getAvailable().length === 0) {
     throw new Error("No authenticated models are available for the agent runtime");
   }
-  if (config.modelProvider) {
-    return { model: undefined, label: `${config.modelProvider}/* (provider default)` };
+  if (modelProvider) {
+    return { model: undefined, label: `${modelProvider}/${modelId ?? "*"} ${modelId ? "" : "(provider default)"}`.trim() };
   }
   return { model: undefined, label: "auto (runtime default)" };
+}
+
+function resolveSelectedCronSkills(
+  workspaceRoot: string,
+  conversationPaths: ReturnType<typeof getConversationPaths>,
+  requestedNames: string[]
+): { skills: Skill[]; missingSkillNames: string[] } {
+  const available = loadWorkspaceAndConversationSkills(workspaceRoot, conversationPaths);
+  if (requestedNames.length === 0) {
+    return { skills: available, missingSkillNames: [] };
+  }
+  const availableByName = new Map<string, Skill>(available.map((skill) => [skill.name, skill]));
+  const skills: Skill[] = [];
+  const missingSkillNames: string[] = [];
+  for (const name of requestedNames) {
+    const skill = availableByName.get(name);
+    if (skill) {
+      skills.push(skill);
+    } else {
+      missingSkillNames.push(name);
+    }
+  }
+  return { skills, missingSkillNames };
 }
 
 export async function createConversationServices(
@@ -326,6 +517,7 @@ export async function runConversationTurn(
 
   const memory = readMemory(services.config.workspaceRoot, paths);
   const skills = loadWorkspaceAndConversationSkills(services.config.workspaceRoot, paths);
+  const recentCronDeliveries = formatRecentCronDeliveriesForPrompt(loadRecentCronDeliveries(paths));
   logger.info("Loaded conversation context", {
     conversationKey: paths.key,
     memoryChars: memory.length,
@@ -333,7 +525,11 @@ export async function runConversationTurn(
     attachmentCount: attachments.length,
     userTextChars: userText.length
   });
-  const resourceLoader = buildResourceLoader(services.config, conversation, memory, skills);
+  const resourceLoader = buildResourceLoader(
+    services.config,
+    skills,
+    buildTelegramPromptAppend(services.config.workspaceRoot, conversation, paths, memory, recentCronDeliveries)
+  );
   await resourceLoader.reload();
 
   const sessionManager =
@@ -342,7 +538,8 @@ export async function runConversationTurn(
 
   const customTools: ToolDefinition[] = [
     createAttachTool(services),
-    createComputerUseTool(conversation, services, approvalStore)
+    createComputerUseTool(conversation, services, approvalStore),
+    createCronTaskTool(conversation, services)
   ];
 
   const resolved = describeResolvedModel(services.config, services.modelRegistry);
@@ -461,6 +658,131 @@ export async function runConversationTurn(
     unsubscribe();
     session.dispose();
     logger.debug("Disposed agent session", { conversationKey: paths.key });
+  }
+}
+
+export async function runScheduledTask(
+  services: ConversationServices,
+  job: CronJob
+): Promise<{
+  runId: string;
+  reply: string;
+  summary: string;
+  missingSkillNames: string[];
+}> {
+  const conversation: ConversationRef = {
+    platform: "telegram",
+    chatId: job.origin.chatId,
+    threadId: job.origin.threadId,
+    userId: job.origin.userId
+  };
+  const originPaths = getConversationPaths(services.config.stateRoot, conversation);
+  const runId = createCronRunId();
+  const runPaths = createCronRunPaths(services.config.stateRoot, job.id, runId);
+  await mkdir(runPaths.dir, { recursive: true });
+  await mkdir(runPaths.attachmentsDir, { recursive: true });
+  await mkdir(runPaths.scratchDir, { recursive: true });
+
+  const memory = readMemory(services.config.workspaceRoot, originPaths);
+  const recentCronDeliveries = formatRecentCronDeliveriesForPrompt(loadRecentCronDeliveries(originPaths));
+  const { skills, missingSkillNames } = resolveSelectedCronSkills(
+    services.config.workspaceRoot,
+    originPaths,
+    job.skillNames
+  );
+  const resourceLoader = buildResourceLoader(
+    services.config,
+    skills,
+    buildCronTaskPromptAppend({
+      workspaceRoot: services.config.workspaceRoot,
+      jobName: job.name,
+      runDir: runPaths.dir,
+      origin: conversation,
+      memory,
+      recentCronDeliveries,
+      selectedSkills: job.skillNames
+    })
+  );
+  await resourceLoader.reload();
+
+  const sessionManager = await exists(runPaths.sessionFile)
+    ? SessionManager.open(runPaths.sessionFile, runPaths.dir, services.config.workspaceRoot)
+    : SessionManager.create(services.config.workspaceRoot, runPaths.dir);
+
+  const customTools: ToolDefinition[] = [createAttachTool(services)];
+  const resolved = describeResolvedModel(services.config, services.modelRegistry, {
+    modelProvider: job.modelProvider,
+    modelId: job.modelId
+  });
+  logger.info("Starting scheduled task run", {
+    jobId: job.id,
+    runId,
+    model: resolved.label,
+    selectedSkills: job.skillNames,
+    missingSkillNames
+  });
+
+  const { session } = await createAgentSession({
+    cwd: services.config.workspaceRoot,
+    agentDir: services.config.agentDir,
+    authStorage: services.authStorage,
+    modelRegistry: services.modelRegistry,
+    model: resolved.model,
+    thinkingLevel: services.config.thinkingLevel,
+    sessionManager,
+    resourceLoader,
+    customTools
+  });
+
+  let streamedReply = "";
+  let finalAssistantReply = "";
+  let finalAssistantError = "";
+  let finalAssistantStopReason = "";
+  let actualModelLabel = "";
+
+  const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+    if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+      streamedReply += event.assistantMessageEvent.delta;
+    }
+    if (event.type === "message_end" && event.message.role === "assistant") {
+      finalAssistantReply = extractTextFromUnknownContent(event.message.content);
+      const details = extractAssistantErrorDetails(event.message);
+      finalAssistantError = details.errorMessage ?? "";
+      finalAssistantStopReason = details.stopReason ?? "";
+      actualModelLabel =
+        details.provider && details.model ? `${details.provider}/${details.model}` : details.model ?? "";
+    }
+  });
+
+  try {
+    const prompt = missingSkillNames.length > 0
+      ? `Requested skills missing: ${missingSkillNames.join(", ")}\n\n${job.prompt}`
+      : job.prompt;
+    await session.prompt(prompt.trim());
+    const extracted = extractLastAssistantText(session);
+    if (!streamedReply.trim() && !finalAssistantReply.trim() && !extracted && finalAssistantError) {
+      const modelText = actualModelLabel || resolved.label;
+      throw new Error(`Model request failed for ${modelText}: ${finalAssistantError}`);
+    }
+    const reply = streamedReply.trim() || finalAssistantReply.trim() || extracted || "Done.";
+    logger.info("Scheduled task run completed", {
+      jobId: job.id,
+      runId,
+      requestedModel: resolved.label,
+      actualModel: actualModelLabel || undefined,
+      stopReason: finalAssistantStopReason || undefined,
+      replyChars: reply.length,
+      missingSkillNames
+    });
+    return {
+      runId,
+      reply,
+      summary: summarizeCronResult(reply),
+      missingSkillNames
+    };
+  } finally {
+    unsubscribe();
+    session.dispose();
   }
 }
 

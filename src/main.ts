@@ -2,14 +2,20 @@
 
 import {
   addChannelCommand,
+  addCronCommand,
   addModelCommand,
   authorizeChannelUserCommand,
   listChannelsCommand,
+  listCronCommand,
   listModelsCommand,
   onboardCommand,
+  pauseCronCommand,
   printUsage,
   restartCommand,
+  removeCronCommand,
   removeModelCommand,
+  resumeCronCommand,
+  runCronCommand,
   startCommand,
   statusCommand,
   stopCommand,
@@ -23,6 +29,11 @@ import { configureNetwork } from "./network.js";
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const [command, subcommand, ...rest] = argv;
+
+  if (command === "--help" || command === "-h" || command === "help") {
+    printUsage();
+    return;
+  }
 
   if (command === "--version" || command === "-v") {
     versionCommand();
@@ -108,6 +119,36 @@ async function main(): Promise<void> {
 
   if (command === "models" && subcommand === "remove") {
     await removeModelCommand(rest[0]);
+    return;
+  }
+
+  if (command === "cron" && subcommand === "add") {
+    await addCronCommand();
+    return;
+  }
+
+  if (command === "cron" && subcommand === "list") {
+    await listCronCommand();
+    return;
+  }
+
+  if (command === "cron" && subcommand === "pause") {
+    await pauseCronCommand(rest[0]);
+    return;
+  }
+
+  if (command === "cron" && subcommand === "resume") {
+    await resumeCronCommand(rest[0]);
+    return;
+  }
+
+  if (command === "cron" && subcommand === "remove") {
+    await removeCronCommand(rest[0]);
+    return;
+  }
+
+  if (command === "cron" && subcommand === "run") {
+    await runCronCommand(rest[0]);
     return;
   }
 

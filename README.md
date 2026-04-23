@@ -8,6 +8,7 @@ Telegram-first agent runtime built on top of `pi-coding-agent`.
 - agent text replies
 - agent image/file sending through `attach`
 - workspace and conversation skills
+- scheduled cron tasks with Telegram delivery
 - default disk-backed memory model
 - limited `computer_use` tool with explicit Telegram approval
 - interactive channel/model onboarding via CLI subcommands
@@ -86,6 +87,31 @@ Upgrade the CLI:
 ```bash
 selfagent --upgrade
 ```
+
+### Manage cron tasks
+
+Add a scheduled task:
+
+```bash
+selfagent cron add
+```
+
+List tasks:
+
+```bash
+selfagent cron list
+```
+
+Pause, resume, trigger, or remove a task:
+
+```bash
+selfagent cron pause <job-id>
+selfagent cron resume <job-id>
+selfagent cron run <job-id>
+selfagent cron remove <job-id>
+```
+
+Tasks created from Telegram conversations can also be managed through the `cron_task` agent tool, and their results are delivered back to the originating Telegram chat or thread.
 
 ### Add a channel
 
@@ -187,6 +213,12 @@ Each Telegram conversation keeps:
 - `attachments/`
 - `scratch/`
 - `approvals.json`
+- `recent-cron-deliveries.json`
+
+Cron task state:
+
+- `~/.selfagent/cron/jobs.json`
+- `~/.selfagent/cron/runs/<job-id>/<run-id>/`
 
 ## Runtime Environment
 

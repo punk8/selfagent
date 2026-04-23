@@ -2,9 +2,17 @@ import { mkdir } from "node:fs/promises";
 import type { AppConfig } from "./config.js";
 import { ApprovalStore } from "./approvals.js";
 import { authorizeTelegramUserFromCode, isTelegramUserAllowed } from "./access.js";
+import {
+  appendCronRunRecord,
+  appendRecentCronDelivery,
+  isCronJobDue,
+  loadCronJobs,
+  saveCronJobs,
+  updateCronJob
+} from "./cron.js";
 import { getConversationPaths } from "./paths.js";
 import { createLogger } from "./logger.js";
-import { createConversationServices, runConversationTurn } from "./session.js";
+import { createConversationServices, runConversationTurn, runScheduledTask } from "./session.js";
 import { TelegramAdapter } from "./telegram.js";
 import { createTelegramPreviewStream } from "./telegram-stream.js";
 import type { ConversationRef } from "./types.js";
@@ -14,6 +22,7 @@ const TELEGRAM_COMMAND_PATTERN = /^\/(?:start|authorize|approve|deny)(?:@\S+)?(?
 const AUTHORIZATION_CODE_PATTERN = /^[A-Z2-9]{6,16}$/;
 const TELEGRAM_PREVIEW_MIN_CHARS = 48;
 const TELEGRAM_PREVIEW_THROTTLE_MS = 1000;
+const CRON_TICK_MS = 30_000;
 
 type TelegramFormattedAdapter = TelegramAdapter & {
   sendFormattedText?: (chatId: number, text: string, threadId?: number) => Promise<unknown>;
@@ -32,11 +41,11 @@ async function sendTelegramFinalReply(
   chatId: number,
   text: string,
   threadId?: number
-): Promise<void> {
+): Promise<number[]> {
   if (typeof adapter.sendFormattedText === "function") {
     try {
-      await adapter.sendFormattedText(chatId, text, threadId);
-      return;
+      const result = await adapter.sendFormattedText(chatId, text, threadId);
+      return result?.messageIds ?? [];
     } catch (error) {
       logger.warn("Formatted Telegram send failed, falling back to plain text", {
         chatId,
@@ -45,11 +54,12 @@ async function sendTelegramFinalReply(
       });
       if (typeof adapter.sendPlainText === "function") {
         await adapter.sendPlainText(chatId, text, threadId);
-        return;
+        return [];
       }
     }
   }
   await adapter.sendText(chatId, text, threadId);
+  return [];
 }
 
 function getConversationFromMessage(message: {
@@ -121,6 +131,122 @@ export async function startTelegramRuntime(config: AppConfig): Promise<void> {
     }
     return servicesCache.get(paths.key)!;
   }
+
+  let cronTickRunning = false;
+  let cronTimer: ReturnType<typeof setInterval> | undefined;
+  const runCronTick = async (): Promise<void> => {
+    if (cronTickRunning) {
+      logger.debug("Cron tick skipped because a previous tick is still running");
+      return;
+    }
+    cronTickRunning = true;
+    try {
+      const jobs = loadCronJobs(config.stateRoot);
+      const dueJobs = jobs.filter((job) => isCronJobDue(job));
+      if (dueJobs.length === 0) {
+        return;
+      }
+      logger.info("Cron tick found due jobs", {
+        dueJobIds: dueJobs.map((job) => job.id),
+        count: dueJobs.length
+      });
+
+      const nextJobs = [...jobs];
+      let jobsChanged = false;
+
+      for (const dueJob of dueJobs) {
+        const jobIndex = nextJobs.findIndex((job) => job.id === dueJob.id);
+        if (jobIndex < 0) {
+          continue;
+        }
+        const job = nextJobs[jobIndex]!;
+        const conversation: ConversationRef = {
+          platform: "telegram",
+          chatId: job.origin.chatId,
+          threadId: job.origin.threadId,
+          userId: job.origin.userId
+        };
+        const paths = getConversationPaths(config.stateRoot, conversation);
+        const startedAt = new Date().toISOString();
+        const services = await getServices(conversation);
+        let deliveredMessageIds: number[] = [];
+        try {
+          const result = await runScheduledTask(services, job);
+          deliveredMessageIds = await sendTelegramFinalReply(
+            deliveryAdapter,
+            conversation.chatId,
+            result.reply,
+            conversation.threadId
+          );
+          const finishedAt = new Date().toISOString();
+          await appendRecentCronDelivery(paths, {
+            jobId: job.id,
+            jobName: job.name,
+            runId: result.runId,
+            deliveredAt: finishedAt,
+            deliveredMessageIds,
+            summary: result.summary,
+            resultText: result.reply
+          });
+          await appendCronRunRecord(config.stateRoot, job.id, result.runId, {
+            runId: result.runId,
+            jobId: job.id,
+            startedAt,
+            finishedAt,
+            status: "ok",
+            resultText: result.reply,
+            summary: result.summary,
+            deliveredMessageIds
+          });
+          nextJobs[jobIndex] = updateCronJob(job, {
+            lastRunAt: finishedAt,
+            lastStatus: "ok",
+            lastError: undefined,
+            lastSummary: result.summary,
+            lastDeliveredAt: finishedAt
+          });
+          jobsChanged = true;
+          logger.info("Scheduled task delivered", {
+            jobId: job.id,
+            runId: result.runId,
+            deliveredMessageIds
+          });
+        } catch (error) {
+          const finishedAt = new Date().toISOString();
+          const message = error instanceof Error ? error.message : String(error);
+          logger.error("Scheduled task run failed", {
+            jobId: job.id,
+            error
+          });
+          const runId = `failed-${Date.now()}`;
+          await appendCronRunRecord(config.stateRoot, job.id, runId, {
+            runId,
+            jobId: job.id,
+            startedAt,
+            finishedAt,
+            status: "error",
+            resultText: "",
+            summary: message,
+            deliveredMessageIds,
+            error: message
+          });
+          nextJobs[jobIndex] = updateCronJob(job, {
+            lastRunAt: finishedAt,
+            lastStatus: "error",
+            lastError: message,
+            lastSummary: undefined
+          });
+          jobsChanged = true;
+        }
+      }
+
+      if (jobsChanged) {
+        await saveCronJobs(config.stateRoot, nextJobs);
+      }
+    } finally {
+      cronTickRunning = false;
+    }
+  };
 
   adapter.bot.command("start", async (ctx) => {
     logger.info("Received /start command", { chatId: ctx.chat.id, userId: ctx.from?.id });
@@ -389,5 +515,16 @@ export async function startTelegramRuntime(config: AppConfig): Promise<void> {
     });
   });
 
-  await adapter.bot.start();
+  await runCronTick();
+  cronTimer = setInterval(() => {
+    void runCronTick();
+  }, CRON_TICK_MS);
+
+  try {
+    await adapter.bot.start();
+  } finally {
+    if (cronTimer) {
+      clearInterval(cronTimer);
+    }
+  }
 }

@@ -1,6 +1,6 @@
 {
   "name": "selfagent",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "bin": {
     "selfagent": "selfagent.mjs"

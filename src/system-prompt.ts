@@ -4,7 +4,8 @@ export function buildTelegramPromptAppend(
   workspaceRoot: string,
   conversation: ConversationRef,
   conversationPaths: ConversationPaths,
-  memory: string
+  memory: string,
+  recentCronDeliveries: string
 ): string {
   return `
 ## SelfAgent Telegram Runtime
@@ -30,6 +31,9 @@ You are operating inside a Telegram-backed agent runtime built on top of pi.
 ### Memory
 ${memory}
 
+### Recent Cron Deliveries
+${recentCronDeliveries}
+
 ### Telegram-Specific Guidance
 - Reply in normal plain text unless formatting is clearly useful.
 - Keep answers concise unless the user asks for depth.
@@ -47,6 +51,43 @@ ${memory}
 - Persist durable facts to workspace or conversation MEMORY.md files when that helps future turns.
 - Use workspace memory for stable preferences, reusable setup, and project-level facts.
 - Use conversation memory for ongoing decisions specific to this Telegram chat.
+`.trim();
+}
+
+export function buildCronTaskPromptAppend(params: {
+  workspaceRoot: string;
+  jobName: string;
+  runDir: string;
+  origin: ConversationRef;
+  memory: string;
+  recentCronDeliveries: string;
+  selectedSkills: string[];
+}): string {
+  return `
+## SelfAgent Scheduled Task Runtime
+
+You are running as an isolated scheduled task inside SelfAgent.
+
+### Task
+- Job name: ${params.jobName}
+- Run workspace: ${params.runDir}
+- Origin platform: Telegram
+- Origin chat ID: ${params.origin.chatId}
+- Origin thread ID: ${params.origin.threadId ?? "(none)"}
+- Selected skills: ${params.selectedSkills.length > 0 ? params.selectedSkills.join(", ") : "(none)"}
+
+### Runtime rules
+- This scheduled run is isolated from the normal Telegram conversation transcript.
+- Your final result will be delivered back to the origin Telegram conversation by the runtime.
+- Do not mention internal file paths unless they are useful to the user.
+- Use the \`attach\` tool when you need to send a file or image artifact.
+- The \`computer_use\` tool is not available in scheduled task runs.
+
+### Memory
+${params.memory}
+
+### Recent Cron Deliveries For This Conversation
+${params.recentCronDeliveries}
 `.trim();
 }
 

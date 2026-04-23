@@ -18,6 +18,7 @@ export function getConversationPaths(stateRoot: string, conversation: Conversati
     skillsDir: resolve(dir, "skills"),
     scratchDir: resolve(dir, "scratch"),
     memoryFile: resolve(dir, "MEMORY.md"),
-    approvalFile: resolve(dir, "approvals.json")
+    approvalFile: resolve(dir, "approvals.json"),
+    recentCronDeliveriesFile: resolve(dir, "recent-cron-deliveries.json")
   };
 }

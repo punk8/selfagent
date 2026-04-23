@@ -14,6 +14,7 @@ export interface ConversationPaths {
   scratchDir: string;
   memoryFile: string;
   approvalFile: string;
+  recentCronDeliveriesFile: string;
 }
 
 export interface IncomingAttachment {
