@@ -1,0 +1,307 @@
+import { mkdir } from "node:fs/promises";
+import type { AppConfig } from "./config.js";
+import { ApprovalStore } from "./approvals.js";
+import { authorizeTelegramUserFromCode, isTelegramUserAllowed } from "./access.js";
+import { getConversationPaths } from "./paths.js";
+import { createLogger } from "./logger.js";
+import { createConversationServices, runConversationTurn } from "./session.js";
+import { TelegramAdapter } from "./telegram.js";
+import type { ConversationRef } from "./types.js";
+
+const logger = createLogger("runtime");
+const TELEGRAM_COMMAND_PATTERN = /^\/(?:start|authorize|approve|deny)(?:@\S+)?(?:\s|$)/i;
+const AUTHORIZATION_CODE_PATTERN = /^[A-Z2-9]{6,16}$/;
+
+function getConversationFromMessage(message: {
+  chat: { id: number };
+  from?: { id: number };
+  message_thread_id?: number;
+}): ConversationRef {
+  return {
+    platform: "telegram",
+    chatId: message.chat.id,
+    threadId: message.message_thread_id,
+    userId: message.from?.id
+  };
+}
+
+export async function startTelegramRuntime(config: AppConfig): Promise<void> {
+  if (config.channel !== "telegram") {
+    throw new Error(`Unsupported configured channel: ${config.channel ?? "(none)"}`);
+  }
+  if (!config.telegramBotToken) {
+    throw new Error("Missing Telegram bot token");
+  }
+
+  await mkdir(config.stateRoot, { recursive: true });
+  const adapter = new TelegramAdapter(config.telegramBotToken);
+  const me = await adapter.bot.api.getMe();
+  logger.info("Telegram bot authenticated", {
+    username: me.username ?? me.first_name,
+    id: me.id
+  });
+  logger.info("Polling Telegram updates");
+
+  const servicesCache = new Map<string, Awaited<ReturnType<typeof createConversationServices>>>();
+  const conversationQueues = new Map<string, Promise<void>>();
+
+  function enqueue(key: string, work: () => Promise<void>): void {
+    const previous = conversationQueues.get(key) ?? Promise.resolve();
+    logger.debug("Queueing conversation work", {
+      conversationKey: key,
+      alreadyQueued: conversationQueues.has(key)
+    });
+    const next = previous.then(work, work);
+    conversationQueues.set(
+      key,
+      next.finally(() => {
+        if (conversationQueues.get(key) === next) {
+          conversationQueues.delete(key);
+        }
+      })
+    );
+  }
+
+  async function getServices(conversation: ConversationRef) {
+    const paths = getConversationPaths(config.stateRoot, conversation);
+    if (!servicesCache.has(paths.key)) {
+      logger.info("Creating conversation services", { conversationKey: paths.key });
+      servicesCache.set(
+        paths.key,
+        await createConversationServices(config, conversation, {
+          sendAttachment: async (filePath, title) => {
+            await adapter.sendAttachment(conversation.chatId, filePath, title, conversation.threadId);
+          },
+          requestApproval: async (summary, requestId) => {
+            await adapter.sendApprovalRequest(conversation.chatId, summary, requestId, conversation.threadId);
+          }
+        })
+      );
+    }
+    return servicesCache.get(paths.key)!;
+  }
+
+  adapter.bot.command("start", async (ctx) => {
+    logger.info("Received /start command", { chatId: ctx.chat.id, userId: ctx.from?.id });
+    if (!isTelegramUserAllowed(config, ctx.from?.id)) {
+      await ctx.reply("This bot is private. Ask the operator to start an authorization request and then send /authorize <code>.");
+      return;
+    }
+    await ctx.reply("SelfAgent is online. Send a message to start a Telegram-backed agent session.");
+  });
+
+  adapter.bot.command("authorize", async (ctx) => {
+    const rawText = ctx.msg.text ?? "";
+    const code = rawText.replace(/^\/authorize(?:@\S+)?\s*/i, "").trim().toUpperCase();
+    logger.info("Received /authorize command", {
+      chatId: ctx.chat.id,
+      userId: ctx.from?.id,
+      hasCode: Boolean(code)
+    });
+    if (!ctx.from?.id) {
+      await ctx.reply("Unable to identify the Telegram user for this authorization.");
+      return;
+    }
+    if (!code) {
+      await ctx.reply("Usage: /authorize <code>");
+      return;
+    }
+    const result = await authorizeTelegramUserFromCode(config, code, ctx.from.id);
+    if (!result.ok) {
+      await ctx.reply(result.reason);
+      return;
+    }
+    await ctx.reply("Authorization complete. This Telegram account is now allowed to use the bot.");
+  });
+
+  adapter.bot.command("approve", async (ctx) => {
+    if (!isTelegramUserAllowed(config, ctx.from?.id)) {
+      await ctx.reply("This bot is private. You are not on the allowlist.");
+      return;
+    }
+    const conversation = getConversationFromMessage(ctx.msg);
+    const paths = getConversationPaths(config.stateRoot, conversation);
+    const store = new ApprovalStore(paths.approvalFile);
+    const state = store.getState();
+    if (!state.pending) {
+      logger.info("Approval requested with no pending request", { conversationKey: paths.key });
+      await ctx.reply("No pending computer-use approval request.");
+      return;
+    }
+    await store.grant("session", ctx.from?.id);
+    logger.info("Approved computer-use from command", { conversationKey: paths.key, actorUserId: ctx.from?.id });
+    await ctx.reply("Computer-use approved for this session.");
+  });
+
+  adapter.bot.command("deny", async (ctx) => {
+    if (!isTelegramUserAllowed(config, ctx.from?.id)) {
+      await ctx.reply("This bot is private. You are not on the allowlist.");
+      return;
+    }
+    const conversation = getConversationFromMessage(ctx.msg);
+    const paths = getConversationPaths(config.stateRoot, conversation);
+    const store = new ApprovalStore(paths.approvalFile);
+    await store.deny();
+    logger.info("Denied computer-use from command", { conversationKey: paths.key, actorUserId: ctx.from?.id });
+    await ctx.reply("Pending computer-use approval cleared.");
+  });
+
+  adapter.bot.on("callback_query:data", async (ctx) => {
+    const data = ctx.callbackQuery.data;
+    const message = ctx.callbackQuery.message;
+    if (!message) {
+      logger.warn("Callback query missing message context", { data });
+      await ctx.answerCallbackQuery({ text: "No message context available." });
+      return;
+    }
+    const conversation = getConversationFromMessage(message);
+    const paths = getConversationPaths(config.stateRoot, conversation);
+    const store = new ApprovalStore(paths.approvalFile);
+    const state = store.getState();
+    const [, action, modeOrRequest, requestId] = data.split(":");
+    if (!state.pending) {
+      logger.info("Callback query received with no pending approval", { conversationKey: paths.key, data });
+      await ctx.answerCallbackQuery({ text: "No pending request." });
+      return;
+    }
+    const expectedRequestId = action === "approve" ? requestId : modeOrRequest;
+    if (state.pending.requestId !== expectedRequestId) {
+      logger.warn("Stale approval callback received", {
+        conversationKey: paths.key,
+        expectedRequestId: state.pending.requestId,
+        receivedRequestId: expectedRequestId
+      });
+      await ctx.answerCallbackQuery({ text: "This approval request is stale." });
+      return;
+    }
+    if (state.pending.requestedByUserId !== undefined && state.pending.requestedByUserId !== ctx.from.id) {
+      logger.warn("Approval callback rejected due to user mismatch", {
+        conversationKey: paths.key,
+        requestedByUserId: state.pending.requestedByUserId,
+        actorUserId: ctx.from.id
+      });
+      await ctx.answerCallbackQuery({ text: "Only the requesting user can approve this action." });
+      return;
+    }
+    if (action === "approve") {
+      const mode = modeOrRequest === "once" ? "once" : "session";
+      await store.grant(mode, ctx.from.id);
+      logger.info("Approved computer-use from callback", {
+        conversationKey: paths.key,
+        actorUserId: ctx.from.id,
+        mode
+      });
+      await ctx.answerCallbackQuery({ text: mode === "once" ? "Approved once." : "Approved for this session." });
+      await ctx.reply(
+        mode === "once"
+          ? "Computer-use approved once. Ask again to execute it."
+          : "Computer-use approved for this session."
+      );
+      return;
+    }
+    if (action === "deny") {
+      await store.deny();
+      logger.info("Denied computer-use from callback", {
+        conversationKey: paths.key,
+        actorUserId: ctx.from.id
+      });
+      await ctx.answerCallbackQuery({ text: "Denied." });
+      await ctx.reply("Computer-use request denied.");
+    }
+  });
+
+  adapter.bot.on("message", async (ctx) => {
+    const text = ctx.msg.text ?? ctx.msg.caption ?? "";
+    const conversation = getConversationFromMessage(ctx.msg);
+    const normalizedText = text.trim().toUpperCase();
+
+    if (TELEGRAM_COMMAND_PATTERN.test(text.trim())) {
+      logger.debug("Skipping generic message handler for Telegram command", {
+        chatId: conversation.chatId,
+        userId: conversation.userId,
+        textPreview: text.slice(0, 120)
+      });
+      return;
+    }
+
+    if (conversation.userId && AUTHORIZATION_CODE_PATTERN.test(normalizedText)) {
+      const authorization = await authorizeTelegramUserFromCode(config, normalizedText, conversation.userId);
+      if (authorization.ok) {
+        logger.info("Authorized Telegram user from bare code message", {
+          chatId: conversation.chatId,
+          userId: conversation.userId,
+          profileId: authorization.profileId
+        });
+        await adapter.sendText(
+          conversation.chatId,
+          "Authorization complete. This Telegram account is now allowed to use the bot.",
+          conversation.threadId
+        );
+        return;
+      }
+      logger.debug("Bare authorization code message did not authorize user", {
+        chatId: conversation.chatId,
+        userId: conversation.userId,
+        reason: authorization.reason
+      });
+    }
+
+    if (!isTelegramUserAllowed(config, conversation.userId)) {
+      logger.warn("Blocked unauthorized Telegram message", {
+        chatId: conversation.chatId,
+        userId: conversation.userId,
+        textPreview: text.slice(0, 120)
+      });
+      await adapter.sendText(
+        conversation.chatId,
+        "This bot is private. Ask the operator to start an authorization request and then send /authorize <code>.",
+        conversation.threadId
+      );
+      return;
+    }
+    const paths = getConversationPaths(config.stateRoot, conversation);
+    logger.info("Incoming Telegram message", {
+      conversationKey: paths.key,
+      chatId: conversation.chatId,
+      userId: conversation.userId,
+      threadId: conversation.threadId,
+      textPreview: text.slice(0, 120),
+      hasPhoto: Boolean(ctx.msg.photo?.length),
+      hasDocument: Boolean(ctx.msg.document)
+    });
+    enqueue(paths.key, async () => {
+      try {
+        await mkdir(paths.attachmentsDir, { recursive: true });
+        const attachments = await adapter.collectIncomingAttachments(ctx.msg, paths.attachmentsDir);
+        logger.info("Conversation work started", {
+          conversationKey: paths.key,
+          attachmentCount: attachments.length
+        });
+        const services = await getServices(conversation);
+        const typingLoop = setInterval(() => {
+          void adapter.sendTyping(conversation.chatId, conversation.threadId);
+        }, 4000);
+        try {
+          await adapter.sendTyping(conversation.chatId, conversation.threadId);
+          const reply = await runConversationTurn(services, conversation, text, attachments);
+          await adapter.sendText(conversation.chatId, reply, conversation.threadId);
+          logger.info("Reply sent", {
+            conversationKey: paths.key,
+            replyChars: reply.length
+          });
+        } finally {
+          clearInterval(typingLoop);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logger.error("Conversation handling failed", {
+          conversationKey: paths.key,
+          error
+        });
+        await adapter.sendText(conversation.chatId, `Error: ${message}`, conversation.threadId);
+      }
+    });
+  });
+
+  await adapter.bot.start();
+}
