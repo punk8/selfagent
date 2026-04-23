@@ -1,18 +1,45 @@
+#!/usr/bin/env node
+
 import {
   addChannelCommand,
   addModelCommand,
   authorizeChannelUserCommand,
+  listChannelsCommand,
+  listModelsCommand,
+  onboardCommand,
   printUsage,
+  restartCommand,
+  removeModelCommand,
   startCommand,
   statusCommand,
-  stopCommand
+  stopCommand,
+  upgradeCommand,
+  versionCommand
 } from "./commands.js";
 import { loadConfig } from "./config.js";
 import { configureLogger, createLogger } from "./logger.js";
+import { configureNetwork } from "./network.js";
 
 async function main(): Promise<void> {
-  const config = loadConfig();
   const argv = process.argv.slice(2);
+  const [command, subcommand, ...rest] = argv;
+
+  if (command === "--version" || command === "-v") {
+    versionCommand();
+    return;
+  }
+
+  if (command === "--upgrade" || command === "upgrade") {
+    await upgradeCommand();
+    return;
+  }
+
+  if (command === "onboard") {
+    await onboardCommand();
+    return;
+  }
+
+  const config = loadConfig();
   const daemonRequested = (!argv[0] || argv[0] === "start") && argv.includes("--daemon");
   const effectiveLogFile = daemonRequested ? config.logFile ?? `${config.stateRoot}/logs/runtime.log` : config.logFile;
   configureLogger({
@@ -21,9 +48,9 @@ async function main(): Promise<void> {
     maxBytes: config.logMaxBytes,
     maxFiles: config.logMaxFiles
   });
+  configureNetwork();
   const logger = createLogger("main");
 
-  const [, , command, subcommand] = process.argv;
   logger.info("SelfAgent CLI invoked", {
     argv,
     workspaceRoot: config.workspaceRoot,
@@ -44,6 +71,11 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === "restart") {
+    await restartCommand();
+    return;
+  }
+
   if (command === "status") {
     await statusCommand();
     return;
@@ -51,6 +83,11 @@ async function main(): Promise<void> {
 
   if (command === "channels" && subcommand === "add") {
     await addChannelCommand();
+    return;
+  }
+
+  if (command === "channels" && subcommand === "list") {
+    await listChannelsCommand();
     return;
   }
 
@@ -64,8 +101,26 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === "models" && subcommand === "list") {
+    await listModelsCommand();
+    return;
+  }
+
+  if (command === "models" && subcommand === "remove") {
+    await removeModelCommand(rest[0]);
+    return;
+  }
+
   printUsage();
   process.exitCode = 1;
 }
 
-await main();
+try {
+  await main();
+} catch (error) {
+  const logger = createLogger("main");
+  const message = error instanceof Error ? error.message : String(error);
+  logger.error("SelfAgent CLI failed", { error: message });
+  process.stderr.write(`${message}\n`);
+  process.exitCode = 1;
+}

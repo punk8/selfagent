@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import { homedir } from "node:os";
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { LogLevel } from "./logger.js";
 import type { ChannelProfile, ModelProfile, RootConfigFile } from "./state.js";
@@ -83,11 +84,11 @@ function parsePositiveInteger(value: string | number | undefined, fallback: numb
 
 export function loadConfig(): AppConfig {
   const workspaceRoot = resolve(optionalEnv("SELFAGENT_WORKSPACE_ROOT") ?? process.cwd());
-  const stateRoot = resolve(optionalEnv("SELFAGENT_STATE_DIR") ?? `${workspaceRoot}/.selfagent`);
-  const configFile = resolve(optionalEnv("SELFAGENT_CONFIG_FILE") ?? `${stateRoot}/config.json`);
-  const channelsFile = resolve(optionalEnv("SELFAGENT_CHANNELS_FILE") ?? `${stateRoot}/channels.json`);
-  const modelProfilesFile = resolve(optionalEnv("SELFAGENT_MODEL_PROFILES_FILE") ?? `${stateRoot}/models.json`);
-  const channelAccessFile = resolve(optionalEnv("SELFAGENT_CHANNEL_ACCESS_FILE") ?? `${stateRoot}/channel-access.json`);
+  const stateRoot = resolve(optionalEnv("SELFAGENT_STATE_DIR") ?? `${homedir()}/.selfagent`);
+  const configFile = resolve(optionalEnv("SELFAGENT_CONFIG_FILE") ?? `${stateRoot}/config.toml`);
+  const channelsFile = resolve(optionalEnv("SELFAGENT_CHANNELS_FILE") ?? configFile);
+  const modelProfilesFile = resolve(optionalEnv("SELFAGENT_MODEL_PROFILES_FILE") ?? configFile);
+  const channelAccessFile = resolve(optionalEnv("SELFAGENT_CHANNEL_ACCESS_FILE") ?? configFile);
   const agentDir = resolve(optionalEnv("SELFAGENT_AGENT_DIR") ?? `${stateRoot}/agent`);
   const authFile = resolve(optionalEnv("SELFAGENT_AUTH_FILE") ?? `${agentDir}/auth.json`);
   const modelsFile = resolve(optionalEnv("SELFAGENT_MODELS_FILE") ?? `${agentDir}/models.json`);

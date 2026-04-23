@@ -15,7 +15,13 @@ Telegram-first agent runtime built on top of `pi-coding-agent`.
 ## Install
 
 ```bash
-npm install
+npx selfagent@latest --version
+```
+
+or install globally:
+
+```bash
+npm install -g selfagent
 ```
 
 ## CLI Commands
@@ -23,21 +29,21 @@ npm install
 ### Start the runtime
 
 ```bash
-npm run dev -- start
+selfagent start
 ```
 
 or simply:
 
 ```bash
-npm run dev
+selfagent
 ```
 
-If a default channel or model profile is missing and you are in an interactive terminal, `start` will offer to configure it inline.
+If a default model or channel profile is missing and you are in an interactive terminal, `start` will guide you through configuring it inline.
 
 Run in the background:
 
 ```bash
-npm run dev -- start --daemon
+selfagent start --daemon
 ```
 
 This prints:
@@ -47,26 +53,44 @@ This prints:
 
 It also writes a pid record to:
 
-- `.selfagent/run/selfagent.pid`
+- `~/.selfagent/run/selfagent.pid`
 
 Check daemon status:
 
 ```bash
-npm run dev -- status
+selfagent status
 ```
 
 Stop the daemon:
 
 ```bash
-npm run dev -- stop
+selfagent stop
 ```
 
 `status` also shows whether the Telegram whitelist is enabled and how many users are currently allowed.
 
+Restart the daemon:
+
+```bash
+selfagent restart
+```
+
+Show the installed version:
+
+```bash
+selfagent --version
+```
+
+Upgrade the CLI:
+
+```bash
+selfagent --upgrade
+```
+
 ### Add a channel
 
 ```bash
-npm run dev -- channels add
+selfagent channels add
 ```
 
 Current supported channel:
@@ -83,7 +107,7 @@ This command will prompt for:
 Authorize a Telegram user without manually finding their `user_id`:
 
 ```bash
-npm run dev -- channels authorize-user
+selfagent channels authorize-user
 ```
 
 This command enables the whitelist for the default Telegram profile, generates a short-lived code, and prints the exact message the user should send to the bot.
@@ -99,7 +123,7 @@ When that Telegram user sends the code to the bot, their `user_id` is added to t
 ### Add a model
 
 ```bash
-npm run dev -- models add
+selfagent models add
 ```
 
 This command supports two onboarding modes.
@@ -131,22 +155,29 @@ For OpenAI auth mode, the command prompts for:
 
 ## Configuration Files
 
-SelfAgent now separates root config, channel profiles, model profiles, and projected `pi` runtime files.
+SelfAgent now keeps user-maintained settings in a single TOML file, while still projecting runtime compatibility files for `pi`.
 
-Primary files:
+Primary user config:
 
-- `.selfagent/config.json`
-- `.selfagent/channels.json`
-- `.selfagent/models.json`
+- `~/.selfagent/config.toml`
+
+This file contains:
+
+- default channel/model profile selection
+- channel profiles
+- model profiles
+- Telegram authorization state
+
+Legacy `.json` config files are read as fallback and are folded into `config.toml` on the next save.
 
 Projected runtime compatibility files:
 
-- `.selfagent/agent/auth.json`
-- `.selfagent/agent/models.json`
+- `~/.selfagent/agent/auth.json`
+- `~/.selfagent/agent/models.json`
 
 Conversation state:
 
-- `.selfagent/conversations/telegram/<conversation>/`
+- `~/.selfagent/conversations/telegram/<conversation>/`
 
 Each Telegram conversation keeps:
 
@@ -163,8 +194,9 @@ Optional environment:
 
 ```bash
 export SELFAGENT_WORKSPACE_ROOT=/absolute/path/to/workspace
-export SELFAGENT_STATE_DIR=/absolute/path/to/workspace/.selfagent
-export SELFAGENT_AGENT_DIR=/absolute/path/to/workspace/.selfagent/agent
+export SELFAGENT_STATE_DIR=$HOME/.selfagent
+export SELFAGENT_CONFIG_FILE=$HOME/.selfagent/config.toml
+export SELFAGENT_AGENT_DIR=$HOME/.selfagent/agent
 export SELFAGENT_MODEL_PROVIDER=openai
 export SELFAGENT_MODEL_ID=gpt-5.4
 export SELFAGENT_THINKING_LEVEL=medium
@@ -196,7 +228,7 @@ Default logs go to stdout/stderr.
 You can increase verbosity with:
 
 ```bash
-SELFAGENT_LOG_LEVEL=debug npm run dev -- start
+SELFAGENT_LOG_LEVEL=debug selfagent start
 ```
 
 You can also persist logs to a file with `SELFAGENT_LOG_FILE`.
@@ -204,7 +236,7 @@ You can also persist logs to a file with `SELFAGENT_LOG_FILE`.
 If you use `start --daemon` and do not set `SELFAGENT_LOG_FILE`, SelfAgent defaults to:
 
 ```text
-.selfagent/logs/runtime.log
+~/.selfagent/logs/runtime.log
 ```
 
 ### Built-in Log Rotation

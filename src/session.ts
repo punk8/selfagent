@@ -33,6 +33,11 @@ export interface ConversationServices {
   requestApproval: (summary: string, requestId: string) => Promise<void>;
 }
 
+export interface ConversationTurnCallbacks {
+  onTextDelta?: (delta: string) => Promise<void> | void;
+  onFinalText?: (text: string) => Promise<void> | void;
+}
+
 const attachSchema = Type.Object({
   label: Type.String({ description: "Short description of the file being shared" }),
   path: Type.String({ description: "Absolute or workspace-relative path to the file" }),
@@ -310,7 +315,8 @@ export async function runConversationTurn(
   services: ConversationServices,
   conversation: ConversationRef,
   userText: string,
-  attachments: IncomingAttachment[]
+  attachments: IncomingAttachment[],
+  callbacks: ConversationTurnCallbacks = {}
 ): Promise<string> {
   const paths = getConversationPaths(services.config.stateRoot, conversation);
   await mkdir(paths.dir, { recursive: true });
@@ -363,9 +369,27 @@ export async function runConversationTurn(
   let finalAssistantError = "";
   let finalAssistantStopReason = "";
   let actualModelLabel = "";
+  let callbackQueue = Promise.resolve();
+  let lastFinalCallbackText = "";
+  const queueCallback = (name: "onTextDelta" | "onFinalText", value: string): void => {
+    const callback = callbacks[name];
+    if (!callback) return;
+    callbackQueue = callbackQueue
+      .then(async () => {
+        await callback(value);
+      })
+      .catch((error) => {
+        logger.warn("Conversation callback failed", {
+          conversationKey: paths.key,
+          callback: name,
+          error
+        });
+      });
+  };
   const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
     if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
       streamedReply += event.assistantMessageEvent.delta;
+      queueCallback("onTextDelta", event.assistantMessageEvent.delta);
     }
     if (event.type === "message_end" && event.message.role === "assistant") {
       finalAssistantReply = extractTextFromUnknownContent(event.message.content);
@@ -374,6 +398,10 @@ export async function runConversationTurn(
       finalAssistantStopReason = details.stopReason ?? "";
       actualModelLabel =
         details.provider && details.model ? `${details.provider}/${details.model}` : details.model ?? "";
+      if (finalAssistantReply.trim()) {
+        lastFinalCallbackText = finalAssistantReply;
+        queueCallback("onFinalText", finalAssistantReply);
+      }
     }
     if (event.type === "message_end") {
       const details = extractAssistantErrorDetails(event.message);
@@ -401,12 +429,18 @@ export async function runConversationTurn(
       promptChars: prompt.length
     });
     await session.prompt(prompt);
+    await callbackQueue;
     const extracted = extractLastAssistantText(session);
     if (!streamedReply.trim() && !finalAssistantReply.trim() && !extracted && finalAssistantError) {
       const modelText = actualModelLabel || resolved.label;
       throw new Error(`Model request failed for ${modelText}: ${finalAssistantError}`);
     }
     const reply = streamedReply.trim() || finalAssistantReply.trim() || extracted || "Done.";
+    if (reply !== lastFinalCallbackText) {
+      lastFinalCallbackText = reply;
+      queueCallback("onFinalText", reply);
+      await callbackQueue;
+    }
     logger.info("Agent turn completed", {
       conversationKey: paths.key,
       requestedModel: resolved.label,

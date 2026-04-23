@@ -6,11 +6,51 @@ import { getConversationPaths } from "./paths.js";
 import { createLogger } from "./logger.js";
 import { createConversationServices, runConversationTurn } from "./session.js";
 import { TelegramAdapter } from "./telegram.js";
+import { createTelegramPreviewStream } from "./telegram-stream.js";
 import type { ConversationRef } from "./types.js";
 
 const logger = createLogger("runtime");
 const TELEGRAM_COMMAND_PATTERN = /^\/(?:start|authorize|approve|deny)(?:@\S+)?(?:\s|$)/i;
 const AUTHORIZATION_CODE_PATTERN = /^[A-Z2-9]{6,16}$/;
+const TELEGRAM_PREVIEW_MIN_CHARS = 48;
+const TELEGRAM_PREVIEW_THROTTLE_MS = 1000;
+
+type TelegramFormattedAdapter = TelegramAdapter & {
+  sendFormattedText?: (chatId: number, text: string, threadId?: number) => Promise<unknown>;
+  sendPlainText?: (chatId: number, text: string, threadId?: number) => Promise<void>;
+  sendFormattedPreview?: (chatId: number, text: string, threadId?: number) => Promise<unknown>;
+  editFormattedPreview?: (chatId: number, messageId: number, text: string) => Promise<unknown>;
+  finalizeFormattedPreview?: (chatId: number, messageId: number, text: string, threadId?: number) => Promise<unknown>;
+};
+
+function getFormattedTelegramAdapter(adapter: TelegramAdapter): TelegramFormattedAdapter {
+  return adapter as TelegramFormattedAdapter;
+}
+
+async function sendTelegramFinalReply(
+  adapter: TelegramFormattedAdapter,
+  chatId: number,
+  text: string,
+  threadId?: number
+): Promise<void> {
+  if (typeof adapter.sendFormattedText === "function") {
+    try {
+      await adapter.sendFormattedText(chatId, text, threadId);
+      return;
+    } catch (error) {
+      logger.warn("Formatted Telegram send failed, falling back to plain text", {
+        chatId,
+        threadId,
+        error
+      });
+      if (typeof adapter.sendPlainText === "function") {
+        await adapter.sendPlainText(chatId, text, threadId);
+        return;
+      }
+    }
+  }
+  await adapter.sendText(chatId, text, threadId);
+}
 
 function getConversationFromMessage(message: {
   chat: { id: number };
@@ -41,6 +81,7 @@ export async function startTelegramRuntime(config: AppConfig): Promise<void> {
     id: me.id
   });
   logger.info("Polling Telegram updates");
+  const deliveryAdapter = getFormattedTelegramAdapter(adapter);
 
   const servicesCache = new Map<string, Awaited<ReturnType<typeof createConversationServices>>>();
   const conversationQueues = new Map<string, Promise<void>>();
@@ -278,19 +319,64 @@ export async function startTelegramRuntime(config: AppConfig): Promise<void> {
           attachmentCount: attachments.length
         });
         const services = await getServices(conversation);
+        const previewStream =
+          typeof deliveryAdapter.sendFormattedPreview === "function" &&
+          typeof deliveryAdapter.editFormattedPreview === "function"
+            ? createTelegramPreviewStream({
+                minInitialChars: TELEGRAM_PREVIEW_MIN_CHARS,
+                throttleMs: TELEGRAM_PREVIEW_THROTTLE_MS,
+                sendPreview: (previewText) =>
+                  deliveryAdapter.sendFormattedPreview!(conversation.chatId, previewText, conversation.threadId),
+                editPreview: (messageId, previewText) =>
+                  deliveryAdapter.editFormattedPreview!(conversation.chatId, messageId, previewText)
+              })
+            : undefined;
+        let streamedPreviewText = "";
+        let finalReplyFromCallback = "";
         const typingLoop = setInterval(() => {
           void adapter.sendTyping(conversation.chatId, conversation.threadId);
         }, 4000);
         try {
           await adapter.sendTyping(conversation.chatId, conversation.threadId);
-          const reply = await runConversationTurn(services, conversation, text, attachments);
-          await adapter.sendText(conversation.chatId, reply, conversation.threadId);
+          const reply = await runConversationTurn(services, conversation, text, attachments, {
+            onTextDelta: (delta) => {
+              if (!previewStream) return;
+              streamedPreviewText += delta;
+              void previewStream.update(streamedPreviewText);
+            },
+            onFinalText: (finalText) => {
+              finalReplyFromCallback = finalText;
+              streamedPreviewText = finalText;
+              if (!previewStream) return;
+              void previewStream.update(finalText);
+            }
+          });
+          const finalReply = finalReplyFromCallback.trim() || reply;
+          if (previewStream) {
+            await previewStream.flush();
+          }
+          const previewDelivered =
+            previewStream !== undefined &&
+            !previewStream.failed() &&
+            previewStream.messageId() !== undefined;
+          if (previewDelivered && typeof deliveryAdapter.finalizeFormattedPreview === "function") {
+            await deliveryAdapter.finalizeFormattedPreview!(
+              conversation.chatId,
+              previewStream.messageId()!,
+              finalReply,
+              conversation.threadId
+            );
+          } else {
+            await sendTelegramFinalReply(deliveryAdapter, conversation.chatId, finalReply, conversation.threadId);
+          }
           logger.info("Reply sent", {
             conversationKey: paths.key,
-            replyChars: reply.length
+            replyChars: finalReply.length,
+            previewDelivered
           });
         } finally {
           clearInterval(typingLoop);
+          await previewStream?.stop();
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);

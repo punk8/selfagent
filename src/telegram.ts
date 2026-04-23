@@ -3,10 +3,35 @@ import { basename, extname, resolve } from "node:path";
 import { Bot, InlineKeyboard, InputFile } from "grammy";
 import { lookup as lookupMime } from "mime-types";
 import { createLogger } from "./logger.js";
+import { getNodeHttpProxyAgent } from "./network.js";
+import { prepareTelegramTextChunks, renderTelegramPreview } from "./telegram-format.js";
 import type { IncomingAttachment } from "./types.js";
 
-const TEXT_CHUNK_SIZE = 3500;
 const logger = createLogger("telegram");
+const TELEGRAM_PARSE_ERROR_PATTERN = /can't parse entities|parse entities|find end of the entity/i;
+const TELEGRAM_EMPTY_TEXT_ERROR_PATTERN = /message text is empty/i;
+const TELEGRAM_NOT_MODIFIED_PATTERN = /message is not modified/i;
+
+export type TelegramFormattedSendResult = {
+  messageIds: number[];
+};
+
+export type TelegramFormattedEditResult = {
+  messageId: number;
+  mode: "html" | "plain";
+  overflowMessageIds: number[];
+};
+
+export type TelegramPreviewSendResult = {
+  messageId: number;
+  mode: "html" | "plain";
+};
+
+export type TelegramPreviewFinalizeResult = {
+  messageId: number;
+  mode: "html" | "plain";
+  overflowMessageIds: number[];
+};
 
 function inferIsImage(filePath: string): boolean {
   const mime = lookupMime(filePath);
@@ -25,13 +50,18 @@ export class TelegramAdapter {
   readonly bot: Bot;
 
   constructor(private readonly token: string) {
-    this.bot = new Bot(token);
+    const proxyAgent = getNodeHttpProxyAgent();
+    this.bot = new Bot(token, proxyAgent ? { client: { baseFetchConfig: { agent: proxyAgent } } } : undefined);
     logger.info("Telegram adapter initialized");
   }
 
   async sendText(chatId: number, text: string, threadId?: number): Promise<void> {
-    const chunks = splitText(text);
-    logger.info("Sending Telegram text", {
+    await this.sendFormattedText(chatId, text, threadId);
+  }
+
+  async sendPlainText(chatId: number, text: string, threadId?: number): Promise<void> {
+    const chunks = prepareTelegramTextChunks(text).map((chunk) => chunk.plainText.trim() || "(empty response)");
+    logger.info("Sending Telegram plain text", {
       chatId,
       threadId,
       chunkCount: chunks.length,
@@ -40,6 +70,110 @@ export class TelegramAdapter {
     for (const chunk of chunks) {
       await this.bot.api.sendMessage(chatId, chunk, threadId ? ({ message_thread_id: threadId } as never) : undefined);
     }
+  }
+
+  async sendFormattedText(chatId: number, text: string, threadId?: number): Promise<TelegramFormattedSendResult> {
+    const chunks = prepareTelegramTextChunks(text);
+    logger.info("Sending Telegram formatted text", {
+      chatId,
+      threadId,
+      chunkCount: chunks.length,
+      totalChars: text.length
+    });
+
+    const messageIds: number[] = [];
+    for (const chunk of chunks) {
+      const sent = await this.sendPreparedChunk(chatId, chunk, threadId);
+      messageIds.push(sent.messageId);
+    }
+
+    return { messageIds };
+  }
+
+  async editFormattedText(
+    chatId: number,
+    messageId: number,
+    text: string,
+    threadId?: number
+  ): Promise<TelegramFormattedEditResult> {
+    const chunks = prepareTelegramTextChunks(text);
+    const firstChunk = chunks[0] ?? { html: "", plainText: text.trim() || "(empty response)" };
+    const overflow = chunks.slice(1);
+
+    logger.info("Editing Telegram formatted text", {
+      chatId,
+      threadId,
+      messageId,
+      chunkCount: chunks.length,
+      totalChars: text.length
+    });
+
+    const edited = await this.editPreparedChunk(chatId, messageId, firstChunk);
+    const overflowMessageIds: number[] = [];
+    for (const chunk of overflow) {
+      const sent = await this.sendPreparedChunk(chatId, chunk, threadId);
+      overflowMessageIds.push(sent.messageId);
+    }
+
+    return {
+      messageId,
+      mode: edited.mode,
+      overflowMessageIds
+    };
+  }
+
+  async sendFormattedPreview(chatId: number, text: string, threadId?: number): Promise<TelegramPreviewSendResult> {
+    const chunk = this.preparePreviewChunk(text);
+    logger.info("Sending Telegram preview text", {
+      chatId,
+      threadId,
+      totalChars: text.length,
+      previewChars: chunk.plainText.length
+    });
+    return this.sendPreparedChunk(chatId, chunk, threadId);
+  }
+
+  async editFormattedPreview(chatId: number, messageId: number, text: string): Promise<{ mode: "html" | "plain" }> {
+    const chunk = this.preparePreviewChunk(text);
+    logger.info("Editing Telegram preview text", {
+      chatId,
+      messageId,
+      totalChars: text.length,
+      previewChars: chunk.plainText.length
+    });
+    return this.editPreparedChunk(chatId, messageId, chunk);
+  }
+
+  async finalizeFormattedPreview(
+    chatId: number,
+    messageId: number,
+    text: string,
+    threadId?: number
+  ): Promise<TelegramPreviewFinalizeResult> {
+    const chunks = prepareTelegramTextChunks(text);
+    const firstChunk = chunks[0] ?? { html: "", plainText: text.trim() || "(empty response)" };
+    const overflow = chunks.slice(1);
+
+    logger.info("Finalizing Telegram preview text", {
+      chatId,
+      threadId,
+      messageId,
+      chunkCount: chunks.length,
+      totalChars: text.length
+    });
+
+    const edited = await this.editPreparedChunk(chatId, messageId, firstChunk);
+    const overflowMessageIds: number[] = [];
+    for (const chunk of overflow) {
+      const sent = await this.sendPreparedChunk(chatId, chunk, threadId);
+      overflowMessageIds.push(sent.messageId);
+    }
+
+    return {
+      messageId,
+      mode: edited.mode,
+      overflowMessageIds
+    };
   }
 
   async sendAttachment(chatId: number, filePath: string, title?: string, threadId?: number): Promise<void> {
@@ -126,20 +260,123 @@ export class TelegramAdapter {
     logger.info("Collected incoming attachments", { count: attachments.length, attachmentsDir });
     return attachments;
   }
+
+  private async sendPreparedChunk(
+    chatId: number,
+    chunk: { html: string; plainText: string },
+    threadId?: number
+  ): Promise<{ messageId: number; mode: "html" | "plain" }> {
+    const options = threadId ? ({ message_thread_id: threadId } as never) : undefined;
+    const fallbackText = chunk.plainText.trim() || "(empty response)";
+
+    if (!chunk.html.trim()) {
+      const sent = await this.bot.api.sendMessage(chatId, fallbackText, options);
+      return { messageId: sent.message_id, mode: "plain" };
+    }
+
+    try {
+      const sent = await this.bot.api.sendMessage(
+        chatId,
+        chunk.html,
+        {
+          ...(threadId ? ({ message_thread_id: threadId } as Record<string, unknown>) : {}),
+          parse_mode: "HTML"
+        } as never
+      );
+      return { messageId: sent.message_id, mode: "html" };
+    } catch (error) {
+      if (!isTelegramFormattingFailure(error)) {
+        throw error;
+      }
+
+      logger.warn("Telegram HTML send failed; retrying with plain text", {
+        chatId,
+        threadId,
+        error: getTelegramErrorDescription(error)
+      });
+      const sent = await this.bot.api.sendMessage(chatId, fallbackText, options);
+      return { messageId: sent.message_id, mode: "plain" };
+    }
+  }
+
+  private async editPreparedChunk(
+    chatId: number,
+    messageId: number,
+    chunk: { html: string; plainText: string }
+  ): Promise<{ mode: "html" | "plain" }> {
+    const fallbackText = chunk.plainText.trim() || "(empty response)";
+
+    if (!chunk.html.trim()) {
+      await this.tryEditMessageText(chatId, messageId, fallbackText);
+      return { mode: "plain" };
+    }
+
+    try {
+      await this.tryEditMessageText(chatId, messageId, chunk.html, { parse_mode: "HTML" });
+      return { mode: "html" };
+    } catch (error) {
+      if (!isTelegramFormattingFailure(error)) {
+        throw error;
+      }
+
+      logger.warn("Telegram HTML edit failed; retrying with plain text", {
+        chatId,
+        messageId,
+        error: getTelegramErrorDescription(error)
+      });
+      await this.tryEditMessageText(chatId, messageId, fallbackText);
+      return { mode: "plain" };
+    }
+  }
+
+  private preparePreviewChunk(text: string): { html: string; plainText: string } {
+    const preview = renderTelegramPreview(text);
+    if (!preview) {
+      return {
+        html: "",
+        plainText: text.trim() || "(empty response)"
+      };
+    }
+    return {
+      html: preview.html,
+      plainText: preview.text
+    };
+  }
+
+  private async tryEditMessageText(
+    chatId: number,
+    messageId: number,
+    text: string,
+    options?: Record<string, unknown>
+  ): Promise<void> {
+    try {
+      await this.bot.api.editMessageText(chatId, messageId, text, options as never);
+    } catch (error) {
+      if (isTelegramNotModified(error)) {
+        return;
+      }
+      throw error;
+    }
+  }
 }
 
-function splitText(text: string): string[] {
-  if (!text.trim()) return ["(empty response)"];
-  const chunks: string[] = [];
-  let remaining = text;
-  while (remaining.length > TEXT_CHUNK_SIZE) {
-    let splitIndex = remaining.lastIndexOf("\n", TEXT_CHUNK_SIZE);
-    if (splitIndex < TEXT_CHUNK_SIZE * 0.5) {
-      splitIndex = TEXT_CHUNK_SIZE;
+function getTelegramErrorDescription(error: unknown): string {
+  if (error && typeof error === "object") {
+    if ("description" in error && typeof error.description === "string") {
+      return error.description;
     }
-    chunks.push(remaining.slice(0, splitIndex).trim());
-    remaining = remaining.slice(splitIndex).trim();
+    if ("message" in error && typeof error.message === "string") {
+      return error.message;
+    }
   }
-  if (remaining) chunks.push(remaining);
-  return chunks;
+  return String(error);
+}
+
+function isTelegramFormattingFailure(error: unknown): boolean {
+  const description = getTelegramErrorDescription(error);
+  return TELEGRAM_PARSE_ERROR_PATTERN.test(description) || TELEGRAM_EMPTY_TEXT_ERROR_PATTERN.test(description);
+}
+
+function isTelegramNotModified(error: unknown): boolean {
+  return TELEGRAM_NOT_MODIFIED_PATTERN.test(getTelegramErrorDescription(error));
 }

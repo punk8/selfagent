@@ -1,11 +1,20 @@
 {
   "name": "selfagent",
-  "private": true,
+  "version": "0.1.0",
   "type": "module",
+  "bin": {
+    "selfagent": "selfagent.mjs"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "selfagent.mjs"
+  ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node -e \"const fs=require('fs'); fs.chmodSync('dist/main.js', 0o755); fs.chmodSync('selfagent.mjs', 0o755)\"",
     "dev": "tsx src/main.ts",
-    "start": "node dist/main.js"
+    "start": "node dist/main.js",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "@mariozechner/pi-agent-core": "^0.69.0",

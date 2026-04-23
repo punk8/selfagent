@@ -1,19 +1,14 @@
 import { Writable } from "node:stream";
 import { createInterface } from "node:readline/promises";
-import { mkdir, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
 import { AuthStorage, ModelRegistry } from "@mariozechner/pi-coding-agent";
 import type { AppConfig } from "./config.js";
 import { createLogger } from "./logger.js";
+import { saveRootConfigFile } from "./state.js";
 
 const logger = createLogger("setup");
 
 interface MutableOutput extends Writable {
   muted?: boolean;
-}
-
-async function ensureDirectory(filePath: string): Promise<void> {
-  await mkdir(dirname(filePath), { recursive: true });
 }
 
 function createMutedOutput(): MutableOutput {
@@ -75,22 +70,14 @@ async function choose(question: string, options: string[]): Promise<number> {
 }
 
 async function saveConfig(config: AppConfig): Promise<void> {
-  await ensureDirectory(config.configFile);
-  await writeFile(
-    config.configFile,
-    `${JSON.stringify(
-      {
-        channel: config.channel,
-        telegramBotToken: config.telegramBotToken,
-        modelProvider: config.modelProvider,
-        modelId: config.modelId,
-        thinkingLevel: config.thinkingLevel
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+  await saveRootConfigFile(config.configFile, {
+    ...config.rootConfig,
+    channel: config.channel,
+    telegramBotToken: config.telegramBotToken,
+    modelProvider: config.modelProvider,
+    modelId: config.modelId,
+    thinkingLevel: config.thinkingLevel
+  });
   logger.debug("Persisted interactive config", {
     configFile: config.configFile,
     channel: config.channel,
