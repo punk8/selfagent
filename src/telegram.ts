@@ -1,5 +1,6 @@
+import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
-import { basename, extname, resolve } from "node:path";
+import { basename, extname, isAbsolute, relative, resolve, sep } from "node:path";
 import { Bot, InlineKeyboard, InputFile } from "grammy";
 import { lookup as lookupMime } from "mime-types";
 import { createLogger } from "./logger.js";
@@ -11,6 +12,7 @@ const logger = createLogger("telegram");
 const TELEGRAM_PARSE_ERROR_PATTERN = /can't parse entities|parse entities|find end of the entity/i;
 const TELEGRAM_EMPTY_TEXT_ERROR_PATTERN = /message text is empty/i;
 const TELEGRAM_NOT_MODIFIED_PATTERN = /message is not modified/i;
+const SAFE_ATTACHMENT_NAME_MAX_LENGTH = 180;
 
 export type TelegramFormattedSendResult = {
   messageIds: number[];
@@ -36,6 +38,60 @@ export type TelegramPreviewFinalizeResult = {
 function inferIsImage(filePath: string): boolean {
   const mime = lookupMime(filePath);
   return typeof mime === "string" && mime.startsWith("image/");
+}
+
+function sanitizeFilenameSegment(value: string, fallback: string): string {
+  const sanitized = value
+    .replace(/[\u0000-\u001f\u007f]+/g, "_")
+    .replace(/[^a-zA-Z0-9._-]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^[._-]+|[._-]+$/g, "");
+  return sanitized || fallback;
+}
+
+function safeBasename(value: string | undefined, fallback: string): string {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return fallback;
+  }
+  return basename(trimmed.replace(/\\/g, "/")) || fallback;
+}
+
+function createSafeAttachmentName(params: {
+  preferredName?: string;
+  fallbackStem: string;
+  uniqueId: string;
+  fallbackExtension?: string;
+}): { storageName: string; originalName: string } {
+  const rawBaseName = safeBasename(params.preferredName, params.fallbackStem);
+  const rawExtension = extname(rawBaseName) || params.fallbackExtension || "";
+  const rawStem = rawExtension ? rawBaseName.slice(0, -rawExtension.length) : rawBaseName;
+  const stem = sanitizeFilenameSegment(rawStem, params.fallbackStem);
+  const extensionBody = sanitizeFilenameSegment(rawExtension.replace(/^\.+/, ""), "");
+  const extension = extensionBody ? `.${extensionBody.slice(0, 24)}` : "";
+  const uniqueId = sanitizeFilenameSegment(params.uniqueId, "file").slice(0, 32);
+  const suffix = `-${uniqueId}-${randomUUID().slice(0, 8)}${extension}`;
+  const maxStemLength = Math.max(1, SAFE_ATTACHMENT_NAME_MAX_LENGTH - suffix.length);
+
+  return {
+    storageName: `${stem.slice(0, maxStemLength)}${suffix}`,
+    originalName: sanitizeFilenameSegment(rawBaseName, params.fallbackStem)
+  };
+}
+
+function resolveAttachmentPath(attachmentsDir: string, storageName: string): string {
+  const root = resolve(attachmentsDir);
+  const filePath = resolve(root, storageName);
+  const relativePath = relative(root, filePath);
+  if (
+    relativePath === "" ||
+    relativePath === ".." ||
+    relativePath.startsWith(`..${sep}`) ||
+    isAbsolute(relativePath)
+  ) {
+    throw new Error("Resolved Telegram attachment path escaped the attachments directory");
+  }
+  return filePath;
 }
 
 function buildApprovalKeyboard(requestId: string): InlineKeyboard {
@@ -235,26 +291,39 @@ export class TelegramAdapter {
 
     if (message.photo && message.photo.length > 0) {
       const bestPhoto = message.photo[message.photo.length - 1];
-      const filePath = resolve(attachmentsDir, `photo-${bestPhoto.file_unique_id}.jpg`);
+      const safeName = createSafeAttachmentName({
+        fallbackStem: "photo",
+        uniqueId: bestPhoto.file_unique_id,
+        fallbackExtension: ".jpg"
+      });
+      const filePath = resolveAttachmentPath(attachmentsDir, safeName.storageName);
       await this.downloadFile(bestPhoto.file_id, filePath);
       attachments.push({
         kind: "image",
         filePath,
-        originalName: basename(filePath)
+        originalName: safeName.originalName
       });
       logger.info("Collected incoming photo attachment", { filePath });
     }
 
     if (message.document) {
-      const originalName = message.document.file_name?.trim() || `document-${message.document.file_id}${extname(message.document.file_name ?? "")}`;
-      const filePath = resolve(attachmentsDir, originalName);
+      const safeName = createSafeAttachmentName({
+        preferredName: message.document.file_name,
+        fallbackStem: "document",
+        uniqueId: message.document.file_id
+      });
+      const filePath = resolveAttachmentPath(attachmentsDir, safeName.storageName);
       await this.downloadFile(message.document.file_id, filePath);
       attachments.push({
         kind: "document",
         filePath,
-        originalName
+        originalName: safeName.originalName
       });
-      logger.info("Collected incoming document attachment", { filePath, originalName });
+      logger.info("Collected incoming document attachment", {
+        filePath,
+        originalName: safeName.originalName,
+        storageName: safeName.storageName
+      });
     }
 
     logger.info("Collected incoming attachments", { count: attachments.length, attachmentsDir });
