@@ -36,6 +36,10 @@ export interface AppConfig {
   agentInactivityTimeoutSeconds: number;
   cronInactivityTimeoutSeconds: number;
   cronHardTimeoutSeconds: number;
+  telegramGetUpdatesTimeoutSeconds: number;
+  telegramGetUpdatesRequestTimeoutSeconds: number;
+  telegramPollingStallThresholdSeconds: number;
+  telegramPollingWatchdogSeconds: number;
 }
 
 function optionalEnv(name: string): string | undefined {
@@ -161,6 +165,22 @@ export function loadConfig(): AppConfig {
       optionalEnv("SELFAGENT_CRON_INACTIVITY_TIMEOUT_SECONDS"),
       0
     ),
-    cronHardTimeoutSeconds: parseNonNegativeInteger(optionalEnv("SELFAGENT_CRON_HARD_TIMEOUT_SECONDS"), 0)
+    cronHardTimeoutSeconds: parseNonNegativeInteger(optionalEnv("SELFAGENT_CRON_HARD_TIMEOUT_SECONDS"), 0),
+    telegramGetUpdatesTimeoutSeconds: parsePositiveInteger(
+      optionalEnv("SELFAGENT_TELEGRAM_GET_UPDATES_TIMEOUT_SECONDS"),
+      30
+    ),
+    telegramGetUpdatesRequestTimeoutSeconds: parsePositiveInteger(
+      optionalEnv("SELFAGENT_TELEGRAM_GET_UPDATES_REQUEST_TIMEOUT_SECONDS"),
+      45
+    ),
+    telegramPollingStallThresholdSeconds: parsePositiveInteger(
+      optionalEnv("SELFAGENT_TELEGRAM_POLLING_STALL_THRESHOLD_SECONDS"),
+      120
+    ),
+    telegramPollingWatchdogSeconds: parsePositiveInteger(
+      optionalEnv("SELFAGENT_TELEGRAM_POLLING_WATCHDOG_SECONDS"),
+      30
+    )
   };
 }

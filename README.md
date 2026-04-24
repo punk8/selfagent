@@ -220,6 +220,10 @@ Cron task state:
 - `~/.selfagent/cron/jobs.json`
 - `~/.selfagent/cron/runs/<job-id>/<run-id>/`
 
+Telegram polling state:
+
+- `~/.selfagent/telegram/update-offset.json`
+
 ## Runtime Environment
 
 Optional environment:
@@ -236,6 +240,10 @@ export SELFAGENT_LOG_LEVEL=debug
 export SELFAGENT_LOG_FILE=/absolute/path/to/selfagent.log
 export SELFAGENT_LOG_MAX_BYTES=10485760
 export SELFAGENT_LOG_MAX_FILES=5
+export SELFAGENT_TELEGRAM_GET_UPDATES_TIMEOUT_SECONDS=30
+export SELFAGENT_TELEGRAM_GET_UPDATES_REQUEST_TIMEOUT_SECONDS=45
+export SELFAGENT_TELEGRAM_POLLING_STALL_THRESHOLD_SECONDS=120
+export SELFAGENT_TELEGRAM_POLLING_WATCHDOG_SECONDS=30
 ```
 
 Runtime API-key overrides are still supported and take precedence over stored profile credentials:

@@ -14,6 +14,7 @@ import { getConversationPaths } from "./paths.js";
 import { createLogger } from "./logger.js";
 import { SelfAgentTimeoutError, createConversationServices, runConversationTurn, runScheduledTask } from "./session.js";
 import { TelegramAdapter } from "./telegram.js";
+import { startResilientTelegramPolling } from "./telegram-polling.js";
 import { createTelegramPreviewStream } from "./telegram-stream.js";
 import type { ConversationRef } from "./types.js";
 
@@ -84,14 +85,16 @@ export async function startTelegramRuntime(config: AppConfig): Promise<void> {
   }
 
   await mkdir(config.stateRoot, { recursive: true });
-  const adapter = new TelegramAdapter(config.telegramBotToken);
-  const me = await adapter.bot.api.getMe();
-  logger.info("Telegram bot authenticated", {
-    username: me.username ?? me.first_name,
-    id: me.id
-  });
-  logger.info("Polling Telegram updates");
-  const deliveryAdapter = getFormattedTelegramAdapter(adapter);
+  let activeAdapter: TelegramAdapter | undefined;
+  function getActiveAdapter(): TelegramAdapter {
+    if (!activeAdapter) {
+      throw new Error("Telegram adapter is not ready yet");
+    }
+    return activeAdapter;
+  }
+  function getActiveDeliveryAdapter(): TelegramFormattedAdapter {
+    return getFormattedTelegramAdapter(getActiveAdapter());
+  }
 
   const servicesCache = new Map<string, Awaited<ReturnType<typeof createConversationServices>>>();
   const conversationQueues = new Map<string, Promise<void>>();
@@ -121,10 +124,10 @@ export async function startTelegramRuntime(config: AppConfig): Promise<void> {
         paths.key,
         await createConversationServices(config, conversation, {
           sendAttachment: async (filePath, title) => {
-            await adapter.sendAttachment(conversation.chatId, filePath, title, conversation.threadId);
+            await getActiveAdapter().sendAttachment(conversation.chatId, filePath, title, conversation.threadId);
           },
           requestApproval: async (summary, requestId) => {
-            await adapter.sendApprovalRequest(conversation.chatId, summary, requestId, conversation.threadId);
+            await getActiveAdapter().sendApprovalRequest(conversation.chatId, summary, requestId, conversation.threadId);
           }
         })
       );
@@ -137,6 +140,10 @@ export async function startTelegramRuntime(config: AppConfig): Promise<void> {
   const runCronTick = async (): Promise<void> => {
     if (cronTickRunning) {
       logger.debug("Cron tick skipped because a previous tick is still running");
+      return;
+    }
+    if (!activeAdapter) {
+      logger.debug("Cron tick skipped because Telegram adapter is not ready yet");
       return;
     }
     cronTickRunning = true;
@@ -173,7 +180,7 @@ export async function startTelegramRuntime(config: AppConfig): Promise<void> {
         try {
           const result = await runScheduledTask(services, job);
           deliveredMessageIds = await sendTelegramFinalReply(
-            deliveryAdapter,
+            getActiveDeliveryAdapter(),
             conversation.chatId,
             result.reply,
             conversation.threadId
@@ -220,7 +227,7 @@ export async function startTelegramRuntime(config: AppConfig): Promise<void> {
           });
           if (error instanceof SelfAgentTimeoutError) {
             deliveredMessageIds = await sendTelegramFinalReply(
-              deliveryAdapter,
+              getActiveDeliveryAdapter(),
               conversation.chatId,
               error.message,
               conversation.threadId
@@ -255,6 +262,9 @@ export async function startTelegramRuntime(config: AppConfig): Promise<void> {
       cronTickRunning = false;
     }
   };
+
+  function registerTelegramHandlers(adapter: TelegramAdapter): void {
+    const deliveryAdapter = getFormattedTelegramAdapter(adapter);
 
   adapter.bot.command("start", async (ctx) => {
     logger.info("Received /start command", { chatId: ctx.chat.id, userId: ctx.from?.id });
@@ -523,14 +533,37 @@ export async function startTelegramRuntime(config: AppConfig): Promise<void> {
       }
     });
   });
+  }
 
+  let initialCronRunTriggered = false;
   await runCronTick();
   cronTimer = setInterval(() => {
     void runCronTick();
   }, CRON_TICK_MS);
 
   try {
-    await adapter.bot.start();
+    await startResilientTelegramPolling({
+      config,
+      token: config.telegramBotToken,
+      createAdapter: () => {
+        const adapter = new TelegramAdapter(config.telegramBotToken!);
+        activeAdapter = adapter;
+        return adapter;
+      },
+      registerHandlers: registerTelegramHandlers,
+      onAdapterReady: async (adapter) => {
+        const me = adapter.bot.botInfo;
+        logger.info("Telegram bot authenticated", {
+          username: me.username ?? me.first_name,
+          id: me.id
+        });
+        logger.info("Polling Telegram updates");
+        if (!initialCronRunTriggered) {
+          initialCronRunTriggered = true;
+          await runCronTick();
+        }
+      }
+    });
   } finally {
     if (cronTimer) {
       clearInterval(cronTimer);
