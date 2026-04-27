@@ -126,6 +126,27 @@ Move editor-facing materials to adjacent metadata files:
 
 Generated images should live under an adjacent `images/` directory and be referenced inline from the article body.
 
+### 7. Harness Iteration Loop
+
+When running this as an evaluation workflow, the harness should not stop after the first generation if checks fail.
+
+Default loop:
+
+1. Generate planner brief, article, visuals, and metadata.
+2. Run hard checks.
+3. If checks fail, apply the smallest fix that addresses the failures.
+4. Re-run hard checks.
+5. Repeat until all hard checks pass or `max_iterations` is reached.
+
+Default `max_iterations`: 3.
+
+If the user explicitly asks to generate images, image generation becomes a hard requirement:
+
+- at least one selected visual should be generated when the visual scan identifies a useful visual
+- generated images must be saved under `images/`
+- generated images must be inserted into the article body
+- `meta/visual-opportunity-scan.md` must record which visuals were generated and why
+
 ## Non-Goals
 
 This upgrade does not add:
@@ -171,6 +192,11 @@ This upgrade does not add:
    - prefer `images/` for generated visuals
    - prefer `meta/` for distribution hooks, plans, quality notes, visual scans, and prompts
 
+7. Update harness loop rules
+   - run checks after generation
+   - fix failed checks and re-run until pass or max iterations
+   - treat requested image generation as a hard check
+
 ## Verification
 
 Minimum verification:
@@ -187,3 +213,4 @@ Manual output review should check:
 - visual prompts are only included when useful or requested
 - generated images are inserted into the article body, not only listed in an appendix
 - file-based outputs keep reader-facing article content separate from metadata when possible
+- harness runs continue until hard checks pass or max iterations is reached

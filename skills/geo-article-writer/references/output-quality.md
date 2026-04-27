@@ -213,6 +213,27 @@ Recommended structure:
 
 Do not append editor-facing metadata to the reader-facing article unless the user asks for a single combined file.
 
+## Harness Iteration
+
+When this skill is used inside an evaluation or harness workflow, do not treat the first output as final if hard checks fail.
+
+Use this loop:
+
+1. Generate the article assets.
+2. Run hard checks.
+3. Fix only the failed checks.
+4. Re-run hard checks.
+5. Stop when all hard checks pass or the configured max iteration count is reached.
+
+Default max iterations: 3.
+
+When the user explicitly asks to generate images, check that:
+
+- the visual scan selected at least one useful visual unless none are editorially justified
+- generated image files exist under `images/` or the requested destination
+- generated images are referenced inline from the article body
+- image prompts and visual decisions are recorded in `meta/`
+
 ## Length Guidance
 
 Unless the user specifies length:

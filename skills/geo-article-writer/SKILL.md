@@ -7,6 +7,8 @@ description: Generate GEO-friendly long-form articles from keywords, topics, bra
 
 Use this skill to turn a keyword, topic, website insight, or GEO opportunity into a publishable article.
 
+If the task involves portfolio memory, topic selection, duplicate avoidance, content mix, mention intensity, harness iteration, or "make this better than the previous draft", use `geo-content-operator` first and draft from its brief.
+
 The workflow combines:
 
 - article planning from GEO Companion's keyword article planner
@@ -45,6 +47,7 @@ Ask a follow-up only when the missing detail changes the article direction. Othe
 
 1. Build an article plan.
    - Read `references/article-plan.md` when planning the article.
+   - If a `geo-content-operator` brief is supplied, preserve its content lane, mention intensity, core claim, proof posture, example policy, and visual policy.
    - Define one core claim before drafting.
    - Choose exactly one SEO blog hook pattern.
    - Map it to one canonical hook pattern.
@@ -98,6 +101,8 @@ Visual asset prompt
 If the user asks for a shorter deliverable, follow their requested format.
 
 For file-based article output, keep the main article file reader-facing. Move distribution hooks, article plan, quality notes, visual opportunity scans, and image prompts into adjacent metadata files when possible.
+
+When running an evaluation or harness workflow, iterate until hard checks pass or a clear maximum iteration limit is reached. If the user explicitly asks to generate images, treat image generation, workspace saving, and article-body insertion as required checks.
 
 ## Writing Rules
 
